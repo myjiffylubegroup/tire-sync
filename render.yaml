@@ -1,0 +1,35 @@
+# Render Blueprint for Tire Sync Service
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: tire-sync-service
+    env: docker
+    plan: starter  # $7/month - upgrade if needed
+    healthCheckPath: /health
+    envVars:
+      # MOTOR FTP Credentials
+      - key: MOTOR_FTP_HOST
+        value: delivery.motor.com
+      - key: MOTOR_FTP_USER
+        value: revyourcause_MIS
+      - key: MOTOR_FTP_PASSWORD
+        sync: false  # Set manually in Render dashboard
+      
+      # Supabase
+      - key: SUPABASE_URL
+        sync: false  # Set manually
+      - key: SUPABASE_SERVICE_KEY
+        sync: false  # Set manually
+      
+      # SendGrid Alerts
+      - key: SENDGRID_API_KEY
+        sync: false  # Set manually
+      - key: ALERT_EMAIL
+        sync: false  # Set manually
+      - key: ALERT_FROM_EMAIL
+        value: turbo@myjiffylube.com
+      
+      # Security (optional but recommended)
+      - key: SYNC_API_KEY
+        generateValue: true  # Render will generate a random key

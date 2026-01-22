@@ -1,0 +1,18 @@
+# Tire Sync Service Dependencies
+# Python 3.11+
+
+# Web framework
+flask==3.0.0
+gunicorn==21.2.0
+
+# Supabase client
+supabase==2.3.4
+
+# SFTP/FTP
+paramiko==3.4.0
+
+# Email alerts
+sendgrid==6.11.0
+
+# Utilities
+python-dotenv==1.0.0
