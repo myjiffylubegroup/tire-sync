@@ -191,9 +191,35 @@ def download_and_extract_zip(sftp, filename: str) -> dict:
 
 
 def parse_csv_to_records(csv_content: str) -> list:
-    """Parse CSV string to list of dictionaries."""
+    """Parse CSV string to list of dictionaries with normalized column names."""
     reader = csv.DictReader(io.StringIO(csv_content))
-    return list(reader)
+    records = []
+    first_row = True
+    for row in reader:
+        # Normalize keys: strip whitespace, keep original case
+        normalized = {k.strip(): v for k, v in row.items()}
+        
+        # Log column names from first row for debugging
+        if first_row:
+            logger.info(f"  CSV columns found: {list(normalized.keys())}")
+            logger.info(f"  First record: {normalized}")
+            first_row = False
+            
+        records.append(normalized)
+    return records
+
+
+def find_column(record: dict, possible_names: list) -> str:
+    """Find a column value by trying multiple possible column names."""
+    for name in possible_names:
+        # Try exact match
+        if name in record:
+            return record[name]
+        # Try case-insensitive match
+        for key in record.keys():
+            if key.lower() == name.lower():
+                return record[key]
+    return None
 
 
 def clean_value(value, field_type='string'):
@@ -231,14 +257,31 @@ def sync_motor_table(supabase: Client, table_name: str, records: list, field_map
     """
     logger.info(f"Syncing {len(records)} records to {table_name}")
     
+    # Log actual column names from first record for debugging
+    if records:
+        logger.info(f"  CSV columns: {list(records[0].keys())}")
+    
     # Transform records using field map
     transformed = []
     for record in records:
         row = {}
         for csv_col, (db_col, field_type) in field_map.items():
+            # Try exact match first, then case-insensitive
+            value = None
             if csv_col in record:
-                row[db_col] = clean_value(record[csv_col], field_type)
+                value = record[csv_col]
+            else:
+                # Case-insensitive search
+                for key in record.keys():
+                    if key.lower() == csv_col.lower():
+                        value = record[key]
+                        break
+            row[db_col] = clean_value(value, field_type)
         transformed.append(row)
+    
+    # Log sample transformed record for debugging
+    if transformed:
+        logger.info(f"  Sample transformed record: {transformed[0]}")
     
     # Truncate table
     logger.info(f"  Truncating {table_name}...")
@@ -301,17 +344,17 @@ def sync_motor_data():
         # Format: {'csv_column': ('db_column', 'type')}
         
         chassis_map = {
-            'ChassisId': ('chassis_id', 'integer'),
+            'ChassisID': ('chassis_id', 'integer'),
             'BoltPattern': ('bolt_pattern', 'string'),
             'Hubbore': ('hubbore', 'numeric'),
             'HubboreRear': ('hubbore_rear', 'numeric'),
             'MaxWheelLoad': ('max_wheel_load', 'integer'),
-            'NutOrBolt': ('nut_or_bolt', 'string'),
+            'Nutorbolt': ('nut_or_bolt', 'string'),
             'NutBoltThreadType': ('nut_bolt_thread_type', 'string'),
             'NutBoltHex': ('nut_bolt_hex', 'integer'),
             'BoltLength': ('bolt_length', 'numeric'),
-            'MinBoltLength': ('min_bolt_length', 'integer'),
-            'MaxBoltLength': ('max_bolt_length', 'integer'),
+            'Minboltlength': ('min_bolt_length', 'integer'),
+            'Maxboltlength': ('max_bolt_length', 'integer'),
             'NutBoltTorque': ('nut_bolt_torque', 'string'),
             'AxleWeightFront': ('axle_weight_front', 'string'),
             'AxleWeightRear': ('axle_weight_rear', 'string'),
@@ -319,39 +362,41 @@ def sync_motor_data():
             'StudLength': ('stud_length', 'string'),
         }
         
+        # Note: Vehicles.csv from DataDefinitions only has ID columns, not Name columns
+        # The actual CSV may have more - using case-insensitive matching as fallback
         vehicles_map = {
-            'VehicleId': ('vehicle_id', 'integer'),
-            'BaseVehicleId': ('base_vehicle_id', 'integer'),
-            'YearId': ('year_id', 'integer'),
-            'MakeId': ('make_id', 'integer'),
-            'MakeName': ('make_name', 'string'),
-            'ModelId': ('model_id', 'integer'),
-            'ModelName': ('model_name', 'string'),
-            'SubModelId': ('submodel_id', 'integer'),
-            'SubModelName': ('submodel_name', 'string'),
-            'DriveTypeId': ('drive_type_id', 'integer'),
-            'DriveTypeName': ('drive_type_name', 'string'),
-            'BodyTypeId': ('body_type_id', 'integer'),
-            'BodyTypeName': ('body_type_name', 'string'),
-            'BodyNumDoorsId': ('body_num_doors_id', 'integer'),
-            'BodyNumDoors': ('body_num_doors', 'string'),
-            'BedLengthId': ('bed_length_id', 'integer'),
-            'BedLength': ('bed_length', 'string'),
-            'VehicleTypeId': ('vehicle_type_id', 'integer'),
-            'VehicleTypeName': ('vehicle_type_name', 'string'),
-            'RegionId': ('region_id', 'integer'),
-            'RegionName': ('region_name', 'string'),
+            'VehicleID': ('vehicle_id', 'integer'),
+            'BaseVehicleID': ('base_vehicle_id', 'integer'),
+            'YearID': ('year_id', 'integer'),
+            'MakeID': ('make_id', 'integer'),
+            'MakeName': ('make_name', 'string'),  # May not exist in all versions
+            'ModelID': ('model_id', 'integer'),
+            'ModelName': ('model_name', 'string'),  # May not exist in all versions
+            'SubmodelID': ('submodel_id', 'integer'),
+            'SubModelName': ('submodel_name', 'string'),  # May not exist in all versions
+            'DriveTypeID': ('drive_type_id', 'integer'),
+            'DriveTypeName': ('drive_type_name', 'string'),  # May not exist in all versions
+            'BodyTypeID': ('body_type_id', 'integer'),
+            'BodyTypeName': ('body_type_name', 'string'),  # May not exist in all versions
+            'BodyNumDoorsID': ('body_num_doors_id', 'integer'),
+            'BodyNumDoors': ('body_num_doors', 'string'),  # May not exist in all versions
+            'BedLengthID': ('bed_length_id', 'integer'),
+            'BedLength': ('bed_length', 'string'),  # May not exist in all versions
+            'VehicleTypeID': ('vehicle_type_id', 'integer'),
+            'VehicleTypeName': ('vehicle_type_name', 'string'),  # May not exist in all versions
+            'RegionID': ('region_id', 'integer'),
+            'RegionName': ('region_name', 'string'),  # May not exist in all versions
             'FG_CustomNote': ('fg_custom_note', 'string'),
             'FG_Body': ('fg_body', 'string'),
             'FG_Option': ('fg_option', 'string'),
-            'FG_ChassisId': ('fg_chassis_id', 'integer'),
-            'FG_ModelId': ('fg_model_id', 'integer'),
+            'FG_ChassisID': ('fg_chassis_id', 'integer'),
+            'FG_ModelID': ('fg_model_id', 'integer'),
             'FG_FMK': ('fg_fmk', 'bigint'),
         }
         
         chassis_models_map = {
-            'ChassisId': ('chassis_id', 'integer'),
-            'ModelId': ('model_id', 'integer'),
+            'ChassisID': ('chassis_id', 'integer'),
+            'ModelID': ('model_id', 'integer'),
             'PMetric': ('p_metric', 'string'),
             'TireSize': ('tire_size', 'string'),
             'LoadIndex': ('load_index', 'string'),
@@ -373,12 +418,10 @@ def sync_motor_data():
             'OffsetMaxR': ('offset_max_r', 'numeric'),
             'RimWidth': ('rim_width', 'numeric'),
             'RimDiameter': ('rim_diameter', 'numeric'),
-            'OffsetF': ('offset_f', 'numeric'),
-            'OffsetR': ('offset_r', 'numeric'),
         }
         
         plus_sizes_map = {
-            'ChassisId': ('chassis_id', 'integer'),
+            'ChassisID': ('chassis_id', 'integer'),
             'PlusSizeType': ('plus_size_type', 'string'),
             'WheelSize': ('wheel_size', 'string'),
             'Tire1': ('tire_1', 'string'),
@@ -394,7 +437,7 @@ def sync_motor_data():
         }
         
         minus_sizes_map = {
-            'ChassisId': ('chassis_id', 'integer'),
+            'ChassisID': ('chassis_id', 'integer'),
             'WheelSize': ('wheel_size', 'string'),
             'TireSize': ('tire_size', 'string'),
             'FrontRearOrBoth': ('front_rear_or_both', 'string'),
