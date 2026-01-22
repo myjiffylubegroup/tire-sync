@@ -5,8 +5,9 @@
 flask==3.0.0
 gunicorn==21.2.0
 
-# Supabase client
-supabase==2.3.4
+# Supabase client - pinned to avoid breaking changes
+supabase==1.2.0
+postgrest==0.10.8
 
 # SFTP/FTP
 paramiko==3.4.0
