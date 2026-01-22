@@ -287,8 +287,8 @@ def sync_motor_table(supabase: Client, table_name: str, records: list, field_map
     logger.info(f"  Truncating {table_name}...")
     supabase.table(table_name).delete().neq('created_at', '1900-01-01').execute()
     
-    # Insert in batches (Supabase has limits)
-    batch_size = 1000
+    # Insert in batches (larger batches = faster, but watch for Supabase limits)
+    batch_size = 5000
     inserted = 0
     errors = 0
     
