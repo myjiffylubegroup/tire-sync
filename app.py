@@ -74,7 +74,7 @@ class Config:
     
     # Warehouse mapping
     WAREHOUSE_FRESNO = '4703'
-    WAREHOUSE_SANTA_CLARITA = '4308'
+    WAREHOUSE_SANTA_CLARITA = '4708'
 
 
 def get_supabase() -> Client:
