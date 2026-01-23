@@ -616,7 +616,7 @@ Errors: {result['errors']:,}
 
 Warehouse Breakdown:
 - Fresno (4703): Aggregated
-- Santa Clarita (4308): Aggregated
+- Santa Clarita (4708): Aggregated
 """,
             is_error=False
         )
