@@ -1,16 +1,17 @@
 """
-TIRE SYNC SERVICE - SIMPLIFIED VERSION
-=======================================
-Uses MOTOR TireTechSmart pre-joined data for simpler, faster syncs.
+TIRE SYNC SERVICE - v2.1
+=========================
+Syncs tire data from MOTOR and USVenture to Supabase.
 
 Endpoints:
-- POST /sync/motor   - Sync MOTOR TireTechSmart data
-- POST /sync/usventure - Sync USVenture inventory (TODO)
-- GET /health        - Health check
-- GET /status        - Recent sync history
+- POST /sync/motor     - Sync MOTOR TireTechSmart data (vehicle fitment)
+- POST /sync/usventure - Sync USVenture inventory (pricing & stock)
+- GET /health          - Health check
+- GET /status          - Recent sync history
 
 Environment Variables Required:
 - MOTOR_FTP_HOST, MOTOR_FTP_USER, MOTOR_FTP_PASSWORD
+- USVENTURE_FTP_HOST, USVENTURE_FTP_USER, USVENTURE_FTP_PASSWORD
 - SUPABASE_URL, SUPABASE_SERVICE_KEY
 - SENDGRID_API_KEY, ALERT_EMAIL
 - SYNC_API_KEY (optional)
@@ -24,6 +25,7 @@ import zipfile
 import logging
 from datetime import datetime, timezone
 from functools import wraps
+from ftplib import FTP_TLS
 
 import paramiko
 from flask import Flask, request, jsonify
@@ -45,11 +47,18 @@ app = Flask(__name__)
 # =============================================================================
 
 class Config:
-    # MOTOR FTP
+    # MOTOR FTP (SFTP)
     MOTOR_FTP_HOST = os.environ.get('MOTOR_FTP_HOST', 'delivery.motor.com')
     MOTOR_FTP_USER = os.environ.get('MOTOR_FTP_USER', 'revyourcause_MIS')
     MOTOR_FTP_PASSWORD = os.environ.get('MOTOR_FTP_PASSWORD', '')
     MOTOR_FTP_PATH = '/Specifications_Data/TireTech/'
+    
+    # USVenture FTP (FTPS)
+    USVENTURE_FTP_HOST = os.environ.get('USVENTURE_FTP_HOST', 'usventure.files.com')
+    USVENTURE_FTP_USER = os.environ.get('USVENTURE_FTP_USER', '')
+    USVENTURE_FTP_PASSWORD = os.environ.get('USVENTURE_FTP_PASSWORD', '')
+    USVENTURE_FTP_PATH = '/USAutoForce/JiffyLube_C20219/'
+    USVENTURE_FILENAME = 'USAutoForceInventory.csv'
     
     # Supabase
     SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
@@ -62,6 +71,10 @@ class Config:
     
     # Security
     SYNC_API_KEY = os.environ.get('SYNC_API_KEY', '')
+    
+    # Warehouse mapping
+    WAREHOUSE_FRESNO = '4703'
+    WAREHOUSE_SANTA_CLARITA = '4308'
 
 
 def get_supabase() -> Client:
@@ -127,7 +140,7 @@ def send_alert(subject: str, body: str, is_error: bool = False):
 
 
 # =============================================================================
-# SFTP FUNCTIONS
+# MOTOR SFTP FUNCTIONS
 # =============================================================================
 
 def connect_motor_sftp():
@@ -146,7 +159,6 @@ def find_latest_smart_zip(sftp) -> str:
     sftp.chdir(Config.MOTOR_FTP_PATH)
     files = sftp.listdir()
     
-    # Filter for TireTechSmart zips (not regular TireTech)
     pattern = re.compile(r'^MOTOR_TireTechSmart_(\d{8})\.zip$')
     zip_files = []
     
@@ -159,7 +171,6 @@ def find_latest_smart_zip(sftp) -> str:
     if not zip_files:
         raise FileNotFoundError("No MOTOR_TireTechSmart_*.zip files found")
     
-    # Sort by date descending, get latest
     zip_files.sort(key=lambda x: x[1], reverse=True)
     latest_file = zip_files[0][0]
     
@@ -176,19 +187,51 @@ def download_and_extract_smart_csv(sftp, filename: str) -> str:
         zip_buffer.seek(0)
         
         with zipfile.ZipFile(zip_buffer, 'r') as zf:
-            # Find the tire-smart-submodel-vehicles.csv file
             for name in zf.namelist():
                 if 'tire-smart-submodel-vehicles' in name.lower() and name.endswith('.csv'):
                     logger.info(f"  Extracting {name}")
                     return zf.read(name).decode('utf-8-sig')
             
-            # If exact name not found, list what's in the zip
             logger.error(f"  Files in zip: {zf.namelist()}")
             raise FileNotFoundError("tire-smart-submodel-vehicles.csv not found in zip")
 
 
 # =============================================================================
-# DATA SYNC
+# USVENTURE FTPS FUNCTIONS
+# =============================================================================
+
+def connect_usventure_ftps():
+    """Establish FTPS connection to USVenture."""
+    logger.info(f"Connecting to USVenture FTPS: {Config.USVENTURE_FTP_HOST}")
+    
+    ftp = FTP_TLS()
+    ftp.connect(Config.USVENTURE_FTP_HOST, 21)
+    ftp.login(Config.USVENTURE_FTP_USER, Config.USVENTURE_FTP_PASSWORD)
+    ftp.prot_p()  # Switch to secure data connection
+    
+    logger.info("USVenture FTPS connection established")
+    return ftp
+
+
+def download_usventure_csv(ftp) -> str:
+    """Download the USAutoForceInventory.csv file."""
+    ftp.cwd(Config.USVENTURE_FTP_PATH)
+    
+    logger.info(f"Downloading {Config.USVENTURE_FILENAME}...")
+    
+    csv_buffer = io.BytesIO()
+    ftp.retrbinary(f'RETR {Config.USVENTURE_FILENAME}', csv_buffer.write)
+    csv_buffer.seek(0)
+    
+    # Decode the CSV content
+    content = csv_buffer.read().decode('utf-8-sig')
+    logger.info(f"Downloaded {len(content)} bytes")
+    
+    return content
+
+
+# =============================================================================
+# DATA SYNC - MOTOR
 # =============================================================================
 
 def clean_value(value, field_type='string'):
@@ -220,11 +263,7 @@ def clean_value(value, field_type='string'):
 
 
 def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
-    """
-    Sync Smart Vehicles CSV to tt_smart_vehicles table.
-    Uses streaming to minimize memory usage.
-    """
-    # Field mapping: CSV column -> (DB column, type)
+    """Sync Smart Vehicles CSV to tt_smart_vehicles table."""
     field_map = {
         'FG_FMK': ('fg_fmk', 'bigint'),
         'FG_ChassisID': ('fg_chassis_id', 'integer'),
@@ -274,7 +313,6 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
     batch = []
     total_records = 0
     
-    # Truncate table first
     logger.info("  Truncating tt_smart_vehicles...")
     supabase.table('tt_smart_vehicles').delete().neq('created_at', '1900-01-01').execute()
     
@@ -283,16 +321,12 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
     
     for row in reader:
         total_records += 1
-        
-        # Normalize keys
         normalized = {k.strip(): v for k, v in row.items()}
         
-        # Log first row for debugging
         if first_row:
             logger.info(f"  CSV columns: {list(normalized.keys())}")
             first_row = False
         
-        # Transform record
         transformed = {}
         for csv_col, (db_col, field_type) in field_map.items():
             value = normalized.get(csv_col)
@@ -300,7 +334,6 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
         
         batch.append(transformed)
         
-        # Insert when batch is full
         if len(batch) >= batch_size:
             try:
                 supabase.table('tt_smart_vehicles').insert(batch).execute()
@@ -311,7 +344,6 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
                 errors += len(batch)
             batch = []
     
-    # Insert remaining records
     if batch:
         try:
             supabase.table('tt_smart_vehicles').insert(batch).execute()
@@ -325,10 +357,126 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
     return {'inserted': inserted, 'errors': errors, 'total': total_records}
 
 
+# =============================================================================
+# DATA SYNC - USVENTURE
+# =============================================================================
+
+def sync_usventure_inventory(supabase: Client, csv_content: str) -> dict:
+    """
+    Sync USVenture inventory CSV to tire_inventory table.
+    Aggregates quantities by warehouse (Fresno 4703, Santa Clarita 4308).
+    """
+    
+    batch_size = 2000
+    total_records = 0
+    errors = 0
+    
+    # Dictionary to aggregate by part_number
+    inventory_map = {}
+    
+    reader = csv.DictReader(io.StringIO(csv_content))
+    first_row = True
+    
+    for row in reader:
+        total_records += 1
+        
+        if first_row:
+            logger.info(f"  CSV columns: {list(row.keys())}")
+            first_row = False
+        
+        part_number = row.get('PartNumber', '').strip()
+        if not part_number:
+            continue
+        
+        warehouse_code = row.get('D365WarehouseCode', '').strip()
+        quantity = clean_value(row.get('QuantityAvailable', '0'), 'numeric') or 0
+        
+        # If we haven't seen this part number yet, create the record
+        if part_number not in inventory_map:
+            inventory_map[part_number] = {
+                'part_number': part_number,
+                'brand_code': clean_value(row.get('BrandCode'), 'string'),
+                'sales_class': clean_value(row.get('SalesClass'), 'string'),
+                'upc': clean_value(row.get('UPC'), 'string'),
+                'discontinued': clean_value(row.get('DiscontinuedFlag', 'False'), 'boolean'),
+                'is_idle': clean_value(row.get('IsIdle', 'False'), 'boolean'),
+                'tire_type': clean_value(row.get('TireType'), 'string'),
+                'name': clean_value(row.get('Name'), 'string'),
+                'description': clean_value(row.get('Description'), 'string'),
+                'width': clean_value(row.get('Width'), 'integer'),
+                'aspect_ratio': clean_value(row.get('AspectRatio'), 'integer'),
+                'rim_diameter': clean_value(row.get('Rim'), 'integer'),
+                'tire_size': clean_value(row.get('TireSize'), 'string'),
+                'speed_rating': clean_value(row.get('SpeedRating'), 'string'),
+                'load_rating': clean_value(row.get('LoadRating'), 'string'),
+                'load_range': clean_value(row.get('LoadRange'), 'string'),
+                'ply_rating': clean_value(row.get('PlyRating'), 'string'),
+                'utqg': clean_value(row.get('UTQG'), 'string'),
+                'load_capacity': clean_value(row.get('LoadCapacity'), 'string'),
+                'weight': clean_value(row.get('Weight'), 'numeric'),
+                'tread_depth': clean_value(row.get('TreadDepth'), 'string'),
+                'sidewall': clean_value(row.get('Sidewall'), 'string'),
+                'ev_compatible': clean_value(row.get('EVCompatible', 'False'), 'boolean'),
+                'run_flat': clean_value(row.get('RunFlat', 'False'), 'boolean'),
+                'snowflake': clean_value(row.get('Snowflake', 'False'), 'boolean'),
+                'noise_canceling': clean_value(row.get('NoiseCancelingTechnology', 'False'), 'boolean'),
+                'warranty': clean_value(row.get('Warranty'), 'string'),
+                'fet': clean_value(row.get('FET', '0'), 'numeric'),
+                'cost': clean_value(row.get('Cost'), 'numeric'),
+                'retail_price': clean_value(row.get('RetailPrice'), 'numeric'),
+                'map_price': clean_value(row.get('Map'), 'numeric'),
+                'account_number': clean_value(row.get('AccountNumber'), 'string'),
+                'qty_fresno': 0,
+                'qty_santa_clarita': 0,
+                'last_synced_at': datetime.now(timezone.utc).isoformat(),
+            }
+        
+        # Add quantity to appropriate warehouse
+        if warehouse_code == Config.WAREHOUSE_FRESNO:
+            inventory_map[part_number]['qty_fresno'] += quantity
+        elif warehouse_code == Config.WAREHOUSE_SANTA_CLARITA:
+            inventory_map[part_number]['qty_santa_clarita'] += quantity
+        else:
+            # Unknown warehouse - add to general quantity
+            inventory_map[part_number]['qty_fresno'] += quantity
+            logger.warning(f"  Unknown warehouse code: {warehouse_code} for part {part_number}")
+    
+    logger.info(f"  Processed {total_records:,} rows into {len(inventory_map):,} unique parts")
+    
+    # Truncate existing data
+    logger.info("  Truncating tire_inventory...")
+    supabase.table('tire_inventory').delete().neq('created_at', '1900-01-01').execute()
+    
+    # Insert in batches
+    records = list(inventory_map.values())
+    inserted = 0
+    
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        try:
+            supabase.table('tire_inventory').insert(batch).execute()
+            inserted += len(batch)
+            logger.info(f"  Inserted batch: {inserted:,} / {len(records):,} records")
+        except Exception as e:
+            logger.error(f"  Error inserting batch: {e}")
+            errors += len(batch)
+    
+    logger.info(f"  Completed: {inserted:,} inserted, {errors:,} errors")
+    
+    return {
+        'total_rows': total_records,
+        'unique_parts': len(inventory_map),
+        'inserted': inserted,
+        'errors': errors
+    }
+
+
+# =============================================================================
+# SYNC ORCHESTRATION
+# =============================================================================
+
 def sync_motor_data():
-    """
-    Main function to sync MOTOR TireTechSmart data.
-    """
+    """Main function to sync MOTOR TireTechSmart data."""
     start_time = datetime.now(timezone.utc)
     results = {
         'status': 'running',
@@ -343,7 +491,6 @@ def sync_motor_data():
     log_id = None
     
     try:
-        # Log sync start
         log_entry = supabase.table('tire_data_sync_log').insert({
             'sync_type': 'motor_tiretech_smart',
             'status': 'running',
@@ -351,21 +498,16 @@ def sync_motor_data():
         }).execute()
         log_id = log_entry.data[0]['id']
         
-        # Connect to SFTP
         sftp, transport = connect_motor_sftp()
-        
-        # Find and download latest Smart zip
         latest_zip = find_latest_smart_zip(sftp)
         results['source_file'] = latest_zip
         
-        # Extract and sync the CSV
         csv_content = download_and_extract_smart_csv(sftp, latest_zip)
         logger.info(f"Processing Smart Vehicles CSV...")
         
         result = sync_smart_vehicles(supabase, csv_content)
         results['tables']['tt_smart_vehicles'] = result
         
-        # Update sync log
         end_time = datetime.now(timezone.utc)
         results['status'] = 'completed'
         results['completed_at'] = end_time.isoformat()
@@ -378,7 +520,6 @@ def sync_motor_data():
             'completed_at': end_time.isoformat()
         }).eq('id', log_id).execute()
         
-        # Send success alert
         send_alert(
             f"MOTOR Smart Sync Complete",
             f"""Source: {latest_zip}
@@ -395,7 +536,6 @@ Records: {result['inserted']:,} inserted, {result['errors']:,} errors
         results['status'] = 'failed'
         results['error'] = str(e)
         
-        # Update sync log
         if log_id:
             try:
                 supabase.table('tire_data_sync_log').update({
@@ -406,7 +546,6 @@ Records: {result['inserted']:,} inserted, {result['errors']:,} errors
             except:
                 pass
         
-        # Send failure alert
         send_alert(
             f"MOTOR Smart Sync FAILED",
             f"""Error: {str(e)}
@@ -425,6 +564,99 @@ Please check the logs for details.
             transport.close()
 
 
+def sync_usventure_data():
+    """Main function to sync USVenture inventory data."""
+    start_time = datetime.now(timezone.utc)
+    results = {
+        'status': 'running',
+        'started_at': start_time.isoformat(),
+        'source_file': Config.USVENTURE_FILENAME,
+    }
+    
+    supabase = get_supabase()
+    ftp = None
+    log_id = None
+    
+    try:
+        log_entry = supabase.table('tire_data_sync_log').insert({
+            'sync_type': 'usventure_inventory',
+            'status': 'running',
+            'source_file': Config.USVENTURE_FILENAME,
+            'started_at': start_time.isoformat()
+        }).execute()
+        log_id = log_entry.data[0]['id']
+        
+        ftp = connect_usventure_ftps()
+        csv_content = download_usventure_csv(ftp)
+        
+        logger.info("Processing USVenture inventory...")
+        result = sync_usventure_inventory(supabase, csv_content)
+        results['sync_result'] = result
+        
+        end_time = datetime.now(timezone.utc)
+        results['status'] = 'completed'
+        results['completed_at'] = end_time.isoformat()
+        results['duration_seconds'] = (end_time - start_time).total_seconds()
+        
+        supabase.table('tire_data_sync_log').update({
+            'status': 'completed',
+            'records_processed': result['total_rows'],
+            'records_inserted': result['inserted'],
+            'completed_at': end_time.isoformat()
+        }).eq('id', log_id).execute()
+        
+        send_alert(
+            f"USVenture Inventory Sync Complete",
+            f"""Source: {Config.USVENTURE_FILENAME}
+Duration: {results['duration_seconds']:.1f} seconds
+Total Rows: {result['total_rows']:,}
+Unique Parts: {result['unique_parts']:,}
+Inserted: {result['inserted']:,}
+Errors: {result['errors']:,}
+
+Warehouse Breakdown:
+- Fresno (4703): Aggregated
+- Santa Clarita (4308): Aggregated
+""",
+            is_error=False
+        )
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"USVenture sync failed: {e}")
+        results['status'] = 'failed'
+        results['error'] = str(e)
+        
+        if log_id:
+            try:
+                supabase.table('tire_data_sync_log').update({
+                    'status': 'failed',
+                    'error_message': str(e),
+                    'completed_at': datetime.now(timezone.utc).isoformat()
+                }).eq('id', log_id).execute()
+            except:
+                pass
+        
+        send_alert(
+            f"USVenture Inventory Sync FAILED",
+            f"""Error: {str(e)}
+
+Please check the logs for details.
+""",
+            is_error=True
+        )
+        
+        raise
+        
+    finally:
+        if ftp:
+            try:
+                ftp.quit()
+            except:
+                ftp.close()
+
+
 # =============================================================================
 # ROUTES
 # =============================================================================
@@ -435,7 +667,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '2.0-smart',
+        'version': '2.1',
         'timestamp': datetime.now(timezone.utc).isoformat()
     })
 
@@ -462,10 +694,18 @@ def trigger_motor_sync():
 @require_api_key
 def trigger_usventure_sync():
     """Webhook endpoint to trigger USVenture inventory sync."""
-    return jsonify({
-        'status': 'not_implemented',
-        'message': 'USVenture sync not yet implemented. Waiting for file delivery to be restored.'
-    }), 501
+    logger.info("USVenture inventory sync triggered via webhook")
+    
+    try:
+        results = sync_usventure_data()
+        return jsonify(results), 200
+        
+    except Exception as e:
+        logger.error(f"USVenture sync failed: {e}")
+        return jsonify({
+            'status': 'failed',
+            'error': str(e)
+        }), 500
 
 
 @app.route('/status', methods=['GET'])
