@@ -1,5 +1,5 @@
 """
-TIRE SYNC SERVICE - v2.1
+TIRE SYNC SERVICE - v2.2
 =========================
 Syncs tire data from MOTOR and USVenture to Supabase.
 
@@ -15,6 +15,10 @@ Environment Variables Required:
 - SUPABASE_URL, SUPABASE_SERVICE_KEY
 - SENDGRID_API_KEY, ALERT_EMAIL
 - SYNC_API_KEY (optional)
+
+Changelog:
+- v2.2 (2026-01-28): Added sync locking to prevent concurrent runs
+- v2.1: Added USVenture inventory sync endpoint
 """
 
 import os
@@ -23,7 +27,7 @@ import re
 import csv
 import zipfile
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from ftplib import FTP_TLS
 
@@ -75,6 +79,9 @@ class Config:
     # Warehouse mapping
     WAREHOUSE_FRESNO = '4703'
     WAREHOUSE_SANTA_CLARITA = '4708'
+    
+    # Sync lock settings
+    SYNC_LOCK_TIMEOUT_MINUTES = 10  # Consider a sync "stuck" after this many minutes
 
 
 def get_supabase() -> Client:
@@ -100,6 +107,89 @@ def require_api_key(f):
         
         return f(*args, **kwargs)
     return decorated
+
+
+# =============================================================================
+# SYNC LOCKING
+# =============================================================================
+
+def check_sync_lock(supabase: Client, sync_type: str) -> dict:
+    """
+    Check if a sync of the given type is already running.
+    
+    Returns:
+        dict with keys:
+        - locked: bool - True if sync should be blocked
+        - message: str - Explanation
+        - stale_id: int or None - ID of stale lock to clean up
+    """
+    timeout_threshold = datetime.now(timezone.utc) - timedelta(minutes=Config.SYNC_LOCK_TIMEOUT_MINUTES)
+    
+    # Check for any running syncs of this type
+    result = supabase.table('tire_data_sync_log')\
+        .select('id, started_at, status')\
+        .eq('sync_type', sync_type)\
+        .eq('status', 'running')\
+        .order('started_at', desc=True)\
+        .limit(1)\
+        .execute()
+    
+    if not result.data:
+        # No running syncs, we're clear
+        return {'locked': False, 'message': 'No active sync', 'stale_id': None}
+    
+    running_sync = result.data[0]
+    started_at_str = running_sync['started_at']
+    
+    # Parse the timestamp
+    if isinstance(started_at_str, str):
+        # Handle various timestamp formats
+        started_at_str = started_at_str.replace('+00:00', '+0000').replace('Z', '+0000')
+        try:
+            started_at = datetime.strptime(started_at_str[:26] + started_at_str[-5:], '%Y-%m-%dT%H:%M:%S.%f%z')
+        except ValueError:
+            try:
+                started_at = datetime.strptime(started_at_str[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+            except ValueError:
+                # If we can't parse, assume it's stale
+                logger.warning(f"Could not parse timestamp: {started_at_str}, treating as stale")
+                return {
+                    'locked': False, 
+                    'message': f'Found stale sync (unparseable timestamp), cleaning up',
+                    'stale_id': running_sync['id']
+                }
+    else:
+        started_at = started_at_str
+    
+    # Check if the running sync is stale (older than timeout threshold)
+    if started_at < timeout_threshold:
+        logger.warning(f"Found stale sync lock (ID: {running_sync['id']}, started: {started_at})")
+        return {
+            'locked': False,
+            'message': f'Found stale sync (started {started_at}), cleaning up and proceeding',
+            'stale_id': running_sync['id']
+        }
+    
+    # There's an active, recent sync running
+    minutes_running = (datetime.now(timezone.utc) - started_at).total_seconds() / 60
+    return {
+        'locked': True,
+        'message': f'Sync already in progress (ID: {running_sync["id"]}, running for {minutes_running:.1f} minutes)',
+        'stale_id': None
+    }
+
+
+def cleanup_stale_lock(supabase: Client, stale_id: int):
+    """Mark a stale sync as failed."""
+    try:
+        supabase.table('tire_data_sync_log').update({
+            'status': 'failed',
+            'error_message': 'Marked as failed - sync exceeded timeout threshold (presumed stuck/crashed)',
+            'completed_at': datetime.now(timezone.utc).isoformat()
+        }).eq('id', stale_id).execute()
+        logger.info(f"Cleaned up stale sync lock (ID: {stale_id})")
+    except Exception as e:
+        logger.error(f"Failed to clean up stale lock: {e}")
 
 
 # =============================================================================
@@ -477,6 +567,28 @@ def sync_usventure_inventory(supabase: Client, csv_content: str) -> dict:
 
 def sync_motor_data():
     """Main function to sync MOTOR TireTechSmart data."""
+    supabase = get_supabase()
+    
+    # =========================================================================
+    # CHECK SYNC LOCK - Prevent concurrent runs
+    # =========================================================================
+    lock_status = check_sync_lock(supabase, 'motor_tiretech_smart')
+    
+    if lock_status['locked']:
+        logger.warning(f"MOTOR sync blocked: {lock_status['message']}")
+        return {
+            'status': 'skipped',
+            'reason': lock_status['message'],
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    
+    # Clean up stale lock if found
+    if lock_status['stale_id']:
+        cleanup_stale_lock(supabase, lock_status['stale_id'])
+    
+    # =========================================================================
+    # PROCEED WITH SYNC
+    # =========================================================================
     start_time = datetime.now(timezone.utc)
     results = {
         'status': 'running',
@@ -485,7 +597,6 @@ def sync_motor_data():
         'tables': {}
     }
     
-    supabase = get_supabase()
     sftp = None
     transport = None
     log_id = None
@@ -566,6 +677,28 @@ Please check the logs for details.
 
 def sync_usventure_data():
     """Main function to sync USVenture inventory data."""
+    supabase = get_supabase()
+    
+    # =========================================================================
+    # CHECK SYNC LOCK - Prevent concurrent runs
+    # =========================================================================
+    lock_status = check_sync_lock(supabase, 'usventure_inventory')
+    
+    if lock_status['locked']:
+        logger.warning(f"USVenture sync blocked: {lock_status['message']}")
+        return {
+            'status': 'skipped',
+            'reason': lock_status['message'],
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    
+    # Clean up stale lock if found
+    if lock_status['stale_id']:
+        cleanup_stale_lock(supabase, lock_status['stale_id'])
+    
+    # =========================================================================
+    # PROCEED WITH SYNC
+    # =========================================================================
     start_time = datetime.now(timezone.utc)
     results = {
         'status': 'running',
@@ -573,7 +706,6 @@ def sync_usventure_data():
         'source_file': Config.USVENTURE_FILENAME,
     }
     
-    supabase = get_supabase()
     ftp = None
     log_id = None
     
@@ -667,7 +799,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '2.1',
+        'version': '2.2',
         'timestamp': datetime.now(timezone.utc).isoformat()
     })
 
@@ -680,6 +812,11 @@ def trigger_motor_sync():
     
     try:
         results = sync_motor_data()
+        
+        # Return 200 for skipped syncs (not an error, just blocked by lock)
+        if results.get('status') == 'skipped':
+            return jsonify(results), 200
+        
         return jsonify(results), 200
         
     except Exception as e:
@@ -698,6 +835,11 @@ def trigger_usventure_sync():
     
     try:
         results = sync_usventure_data()
+        
+        # Return 200 for skipped syncs (not an error, just blocked by lock)
+        if results.get('status') == 'skipped':
+            return jsonify(results), 200
+        
         return jsonify(results), 200
         
     except Exception as e:
