@@ -1,5 +1,5 @@
 """
-TIRE SYNC SERVICE - v2.3
+TIRE SYNC SERVICE - v2.4
 =========================
 Syncs tire data from MOTOR and USVenture to Supabase.
 
@@ -17,8 +17,8 @@ Environment Variables Required:
 - SYNC_API_KEY (optional)
 
 Changelog:
+- v2.4 (2026-02-05): Added automatic retry logic (3 attempts, 30s delay) for connection failures
 - v2.3 (2026-02-05): CRITICAL FIX - Download and validate data BEFORE truncating tables
-                     Prevents data loss when SFTP connections fail
 - v2.2 (2026-01-28): Added sync locking to prevent concurrent runs
 - v2.1: Added USVenture inventory sync endpoint
 """
@@ -27,6 +27,7 @@ import os
 import io
 import re
 import csv
+import time
 import zipfile
 import logging
 from datetime import datetime, timezone, timedelta
@@ -88,6 +89,10 @@ class Config:
     # Minimum record thresholds for validation (prevents loading empty/corrupt files)
     MIN_MOTOR_RECORDS = 100000  # MOTOR file should have ~124k records
     MIN_USVENTURE_RECORDS = 5000  # USVenture file should have ~12k unique parts
+    
+    # Retry settings
+    MAX_RETRY_ATTEMPTS = 3
+    RETRY_DELAY_SECONDS = 30
 
 
 def get_supabase() -> Client:
@@ -292,6 +297,56 @@ def download_and_extract_smart_csv(sftp, filename: str) -> str:
             raise FileNotFoundError("tire-smart-submodel-vehicles.csv not found in zip")
 
 
+def download_motor_data_with_retry() -> tuple:
+    """
+    Download MOTOR data with automatic retry on connection failures.
+    
+    Returns:
+        tuple: (csv_content: str, source_file: str)
+    
+    Raises:
+        Exception: After all retry attempts exhausted
+    """
+    last_error = None
+    
+    for attempt in range(1, Config.MAX_RETRY_ATTEMPTS + 1):
+        sftp = None
+        transport = None
+        
+        try:
+            logger.info(f"MOTOR download attempt {attempt}/{Config.MAX_RETRY_ATTEMPTS}")
+            
+            sftp, transport = connect_motor_sftp()
+            latest_zip = find_latest_smart_zip(sftp)
+            csv_content = download_and_extract_smart_csv(sftp, latest_zip)
+            
+            logger.info(f"  Download successful on attempt {attempt}")
+            return csv_content, latest_zip
+            
+        except Exception as e:
+            last_error = e
+            logger.warning(f"  Attempt {attempt} failed: {str(e)}")
+            
+            if attempt < Config.MAX_RETRY_ATTEMPTS:
+                logger.info(f"  Waiting {Config.RETRY_DELAY_SECONDS} seconds before retry...")
+                time.sleep(Config.RETRY_DELAY_SECONDS)
+            
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except:
+                    pass
+            if transport:
+                try:
+                    transport.close()
+                except:
+                    pass
+    
+    # All retries exhausted
+    raise Exception(f"MOTOR download failed after {Config.MAX_RETRY_ATTEMPTS} attempts. Last error: {str(last_error)}")
+
+
 # =============================================================================
 # USVENTURE FTPS FUNCTIONS
 # =============================================================================
@@ -324,6 +379,52 @@ def download_usventure_csv(ftp) -> str:
     logger.info(f"Downloaded {len(content)} bytes")
     
     return content
+
+
+def download_usventure_data_with_retry() -> str:
+    """
+    Download USVenture data with automatic retry on connection failures.
+    
+    Returns:
+        str: CSV content
+    
+    Raises:
+        Exception: After all retry attempts exhausted
+    """
+    last_error = None
+    
+    for attempt in range(1, Config.MAX_RETRY_ATTEMPTS + 1):
+        ftp = None
+        
+        try:
+            logger.info(f"USVenture download attempt {attempt}/{Config.MAX_RETRY_ATTEMPTS}")
+            
+            ftp = connect_usventure_ftps()
+            csv_content = download_usventure_csv(ftp)
+            
+            logger.info(f"  Download successful on attempt {attempt}")
+            return csv_content
+            
+        except Exception as e:
+            last_error = e
+            logger.warning(f"  Attempt {attempt} failed: {str(e)}")
+            
+            if attempt < Config.MAX_RETRY_ATTEMPTS:
+                logger.info(f"  Waiting {Config.RETRY_DELAY_SECONDS} seconds before retry...")
+                time.sleep(Config.RETRY_DELAY_SECONDS)
+            
+        finally:
+            if ftp:
+                try:
+                    ftp.quit()
+                except:
+                    try:
+                        ftp.close()
+                    except:
+                        pass
+    
+    # All retries exhausted
+    raise Exception(f"USVenture download failed after {Config.MAX_RETRY_ATTEMPTS} attempts. Last error: {str(last_error)}")
 
 
 # =============================================================================
@@ -589,8 +690,8 @@ def sync_motor_data():
     """
     Main function to sync MOTOR TireTechSmart data.
     
-    SAFE SYNC PATTERN:
-    1. Download data from SFTP
+    SAFE SYNC PATTERN with RETRY:
+    1. Download data from SFTP (with up to 3 retry attempts)
     2. Parse and validate data (check minimum record count)
     3. Only if validation passes: truncate and insert
     4. If any step fails before truncate: existing data is preserved
@@ -625,8 +726,6 @@ def sync_motor_data():
         'tables': {}
     }
     
-    sftp = None
-    transport = None
     log_id = None
     
     try:
@@ -638,15 +737,12 @@ def sync_motor_data():
         log_id = log_entry.data[0]['id']
         
         # =====================================================================
-        # STEP 1: DOWNLOAD - If this fails, existing data is preserved
+        # STEP 1: DOWNLOAD WITH RETRY - If all retries fail, existing data preserved
         # =====================================================================
-        logger.info("Step 1: Connecting to MOTOR SFTP and downloading...")
-        sftp, transport = connect_motor_sftp()
-        latest_zip = find_latest_smart_zip(sftp)
+        logger.info("Step 1: Downloading from MOTOR SFTP (with retry)...")
+        csv_content, latest_zip = download_motor_data_with_retry()
         results['source_file'] = latest_zip
-        
-        csv_content = download_and_extract_smart_csv(sftp, latest_zip)
-        logger.info(f"  Download complete: {len(csv_content):,} bytes")
+        logger.info(f"  Download complete: {len(csv_content):,} bytes from {latest_zip}")
         
         # =====================================================================
         # STEP 2: PARSE AND VALIDATE - If this fails, existing data is preserved
@@ -692,7 +788,7 @@ def sync_motor_data():
 Duration: {results['duration_seconds']:.1f} seconds
 Records: {result['inserted']:,} inserted, {result['errors']:,} errors
 
-Safe sync pattern: Data validated before truncate.
+Features: Auto-retry enabled ({Config.MAX_RETRY_ATTEMPTS} attempts), safe sync pattern.
 """,
             is_error=False
         )
@@ -718,7 +814,8 @@ Safe sync pattern: Data validated before truncate.
             f"MOTOR Smart Sync FAILED",
             f"""Error: {str(e)}
 
-IMPORTANT: Existing data was preserved (truncate only happens after successful download & validation).
+Retry attempts: {Config.MAX_RETRY_ATTEMPTS} (all exhausted)
+Existing data: PRESERVED (truncate only happens after successful download & validation)
 
 Please check the logs for details.
 """,
@@ -726,20 +823,14 @@ Please check the logs for details.
         )
         
         raise
-        
-    finally:
-        if sftp:
-            sftp.close()
-        if transport:
-            transport.close()
 
 
 def sync_usventure_data():
     """
     Main function to sync USVenture inventory data.
     
-    SAFE SYNC PATTERN:
-    1. Download data from FTPS
+    SAFE SYNC PATTERN with RETRY:
+    1. Download data from FTPS (with up to 3 retry attempts)
     2. Parse and validate data (check minimum record count)
     3. Only if validation passes: truncate and insert
     4. If any step fails before truncate: existing data is preserved
@@ -773,7 +864,6 @@ def sync_usventure_data():
         'source_file': Config.USVENTURE_FILENAME,
     }
     
-    ftp = None
     log_id = None
     
     try:
@@ -786,11 +876,10 @@ def sync_usventure_data():
         log_id = log_entry.data[0]['id']
         
         # =====================================================================
-        # STEP 1: DOWNLOAD - If this fails, existing data is preserved
+        # STEP 1: DOWNLOAD WITH RETRY - If all retries fail, existing data preserved
         # =====================================================================
-        logger.info("Step 1: Connecting to USVenture FTPS and downloading...")
-        ftp = connect_usventure_ftps()
-        csv_content = download_usventure_csv(ftp)
+        logger.info("Step 1: Downloading from USVenture FTPS (with retry)...")
+        csv_content = download_usventure_data_with_retry()
         logger.info(f"  Download complete: {len(csv_content):,} bytes")
         
         # =====================================================================
@@ -843,7 +932,7 @@ Warehouse Breakdown:
 - Fresno (4703): Aggregated
 - Santa Clarita (4708): Aggregated
 
-Safe sync pattern: Data validated before truncate.
+Features: Auto-retry enabled ({Config.MAX_RETRY_ATTEMPTS} attempts), safe sync pattern.
 """,
             is_error=False
         )
@@ -869,7 +958,8 @@ Safe sync pattern: Data validated before truncate.
             f"USVenture Inventory Sync FAILED",
             f"""Error: {str(e)}
 
-IMPORTANT: Existing data was preserved (truncate only happens after successful download & validation).
+Retry attempts: {Config.MAX_RETRY_ATTEMPTS} (all exhausted)
+Existing data: PRESERVED (truncate only happens after successful download & validation)
 
 Please check the logs for details.
 """,
@@ -877,13 +967,6 @@ Please check the logs for details.
         )
         
         raise
-        
-    finally:
-        if ftp:
-            try:
-                ftp.quit()
-            except:
-                ftp.close()
 
 
 # =============================================================================
@@ -896,7 +979,13 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '2.3',
+        'version': '2.4',
+        'features': {
+            'auto_retry': True,
+            'max_attempts': Config.MAX_RETRY_ATTEMPTS,
+            'retry_delay_seconds': Config.RETRY_DELAY_SECONDS,
+            'safe_sync_pattern': True
+        },
         'timestamp': datetime.now(timezone.utc).isoformat()
     })
 
