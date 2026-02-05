@@ -1,5 +1,5 @@
 """
-TIRE SYNC SERVICE - v2.2
+TIRE SYNC SERVICE - v2.3
 =========================
 Syncs tire data from MOTOR and USVenture to Supabase.
 
@@ -17,6 +17,8 @@ Environment Variables Required:
 - SYNC_API_KEY (optional)
 
 Changelog:
+- v2.3 (2026-02-05): CRITICAL FIX - Download and validate data BEFORE truncating tables
+                     Prevents data loss when SFTP connections fail
 - v2.2 (2026-01-28): Added sync locking to prevent concurrent runs
 - v2.1: Added USVenture inventory sync endpoint
 """
@@ -82,6 +84,10 @@ class Config:
     
     # Sync lock settings
     SYNC_LOCK_TIMEOUT_MINUTES = 10  # Consider a sync "stuck" after this many minutes
+    
+    # Minimum record thresholds for validation (prevents loading empty/corrupt files)
+    MIN_MOTOR_RECORDS = 100000  # MOTOR file should have ~124k records
+    MIN_USVENTURE_RECORDS = 5000  # USVenture file should have ~12k unique parts
 
 
 def get_supabase() -> Client:
@@ -352,8 +358,12 @@ def clean_value(value, field_type='string'):
         return value if value else None
 
 
-def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
-    """Sync Smart Vehicles CSV to tt_smart_vehicles table."""
+def prepare_smart_vehicles_data(csv_content: str) -> list:
+    """
+    Parse and transform MOTOR Smart Vehicles CSV into database records.
+    Returns list of transformed records ready for insert.
+    Does NOT touch the database - just prepares the data.
+    """
     field_map = {
         'FG_FMK': ('fg_fmk', 'bigint'),
         'FG_ChassisID': ('fg_chassis_id', 'integer'),
@@ -397,20 +407,11 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
         'NumSizesForSubmodel': ('num_sizes_for_submodel', 'integer'),
     }
     
-    batch_size = 5000
-    inserted = 0
-    errors = 0
-    batch = []
-    total_records = 0
-    
-    logger.info("  Truncating tt_smart_vehicles...")
-    supabase.table('tt_smart_vehicles').delete().neq('created_at', '1900-01-01').execute()
-    
+    records = []
     reader = csv.DictReader(io.StringIO(csv_content))
     first_row = True
     
     for row in reader:
-        total_records += 1
         normalized = {k.strip(): v for k, v in row.items()}
         
         if first_row:
@@ -422,25 +423,35 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
             value = normalized.get(csv_col)
             transformed[db_col] = clean_value(value, field_type)
         
-        batch.append(transformed)
-        
-        if len(batch) >= batch_size:
-            try:
-                supabase.table('tt_smart_vehicles').insert(batch).execute()
-                inserted += len(batch)
-                logger.info(f"  Inserted batch: {inserted:,} / {total_records:,} records")
-            except Exception as e:
-                logger.error(f"  Error inserting batch: {e}")
-                errors += len(batch)
-            batch = []
+        records.append(transformed)
     
-    if batch:
+    logger.info(f"  Prepared {len(records):,} records from CSV")
+    return records
+
+
+def insert_smart_vehicles(supabase: Client, records: list) -> dict:
+    """
+    Truncate table and insert prepared records.
+    Only called AFTER data has been downloaded and validated.
+    """
+    batch_size = 5000
+    inserted = 0
+    errors = 0
+    total_records = len(records)
+    
+    # NOW we truncate - only after we have validated data ready
+    logger.info("  Truncating tt_smart_vehicles...")
+    supabase.table('tt_smart_vehicles').delete().neq('created_at', '1900-01-01').execute()
+    
+    # Insert in batches
+    for i in range(0, total_records, batch_size):
+        batch = records[i:i + batch_size]
         try:
             supabase.table('tt_smart_vehicles').insert(batch).execute()
             inserted += len(batch)
-            logger.info(f"  Inserted final batch: {inserted:,} / {total_records:,} records")
+            logger.info(f"  Inserted batch: {inserted:,} / {total_records:,} records")
         except Exception as e:
-            logger.error(f"  Error inserting final batch: {e}")
+            logger.error(f"  Error inserting batch: {e}")
             errors += len(batch)
     
     logger.info(f"  Completed: {inserted:,} inserted, {errors:,} errors")
@@ -451,15 +462,14 @@ def sync_smart_vehicles(supabase: Client, csv_content: str) -> dict:
 # DATA SYNC - USVENTURE
 # =============================================================================
 
-def sync_usventure_inventory(supabase: Client, csv_content: str) -> dict:
+def prepare_usventure_data(csv_content: str) -> list:
     """
-    Sync USVenture inventory CSV to tire_inventory table.
-    Aggregates quantities by warehouse (Fresno 4703, Santa Clarita 4308).
+    Parse and transform USVenture inventory CSV into database records.
+    Aggregates quantities by warehouse (Fresno 4703, Santa Clarita 4708).
+    Returns list of transformed records ready for insert.
+    Does NOT touch the database - just prepares the data.
     """
-    
-    batch_size = 2000
     total_records = 0
-    errors = 0
     
     # Dictionary to aggregate by part_number
     inventory_map = {}
@@ -531,22 +541,33 @@ def sync_usventure_inventory(supabase: Client, csv_content: str) -> dict:
             inventory_map[part_number]['qty_fresno'] += quantity
             logger.warning(f"  Unknown warehouse code: {warehouse_code} for part {part_number}")
     
-    logger.info(f"  Processed {total_records:,} rows into {len(inventory_map):,} unique parts")
+    records = list(inventory_map.values())
+    logger.info(f"  Prepared {len(records):,} unique parts from {total_records:,} CSV rows")
     
-    # Truncate existing data
+    return records
+
+
+def insert_usventure_inventory(supabase: Client, records: list) -> dict:
+    """
+    Truncate table and insert prepared records.
+    Only called AFTER data has been downloaded and validated.
+    """
+    batch_size = 2000
+    inserted = 0
+    errors = 0
+    total_records = len(records)
+    
+    # NOW we truncate - only after we have validated data ready
     logger.info("  Truncating tire_inventory...")
     supabase.table('tire_inventory').delete().neq('created_at', '1900-01-01').execute()
     
     # Insert in batches
-    records = list(inventory_map.values())
-    inserted = 0
-    
-    for i in range(0, len(records), batch_size):
+    for i in range(0, total_records, batch_size):
         batch = records[i:i + batch_size]
         try:
             supabase.table('tire_inventory').insert(batch).execute()
             inserted += len(batch)
-            logger.info(f"  Inserted batch: {inserted:,} / {len(records):,} records")
+            logger.info(f"  Inserted batch: {inserted:,} / {total_records:,} records")
         except Exception as e:
             logger.error(f"  Error inserting batch: {e}")
             errors += len(batch)
@@ -554,8 +575,7 @@ def sync_usventure_inventory(supabase: Client, csv_content: str) -> dict:
     logger.info(f"  Completed: {inserted:,} inserted, {errors:,} errors")
     
     return {
-        'total_rows': total_records,
-        'unique_parts': len(inventory_map),
+        'unique_parts': total_records,
         'inserted': inserted,
         'errors': errors
     }
@@ -566,7 +586,15 @@ def sync_usventure_inventory(supabase: Client, csv_content: str) -> dict:
 # =============================================================================
 
 def sync_motor_data():
-    """Main function to sync MOTOR TireTechSmart data."""
+    """
+    Main function to sync MOTOR TireTechSmart data.
+    
+    SAFE SYNC PATTERN:
+    1. Download data from SFTP
+    2. Parse and validate data (check minimum record count)
+    3. Only if validation passes: truncate and insert
+    4. If any step fails before truncate: existing data is preserved
+    """
     supabase = get_supabase()
     
     # =========================================================================
@@ -609,16 +637,43 @@ def sync_motor_data():
         }).execute()
         log_id = log_entry.data[0]['id']
         
+        # =====================================================================
+        # STEP 1: DOWNLOAD - If this fails, existing data is preserved
+        # =====================================================================
+        logger.info("Step 1: Connecting to MOTOR SFTP and downloading...")
         sftp, transport = connect_motor_sftp()
         latest_zip = find_latest_smart_zip(sftp)
         results['source_file'] = latest_zip
         
         csv_content = download_and_extract_smart_csv(sftp, latest_zip)
-        logger.info(f"Processing Smart Vehicles CSV...")
+        logger.info(f"  Download complete: {len(csv_content):,} bytes")
         
-        result = sync_smart_vehicles(supabase, csv_content)
+        # =====================================================================
+        # STEP 2: PARSE AND VALIDATE - If this fails, existing data is preserved
+        # =====================================================================
+        logger.info("Step 2: Parsing and validating data...")
+        prepared_records = prepare_smart_vehicles_data(csv_content)
+        
+        # Validate minimum record count
+        if len(prepared_records) < Config.MIN_MOTOR_RECORDS:
+            raise ValueError(
+                f"Data validation failed: Only {len(prepared_records):,} records found, "
+                f"minimum required is {Config.MIN_MOTOR_RECORDS:,}. "
+                f"Aborting to preserve existing data."
+            )
+        
+        logger.info(f"  Validation passed: {len(prepared_records):,} records ready")
+        
+        # =====================================================================
+        # STEP 3: TRUNCATE AND INSERT - Only reached if download & validation passed
+        # =====================================================================
+        logger.info("Step 3: Truncating table and inserting new data...")
+        result = insert_smart_vehicles(supabase, prepared_records)
         results['tables']['tt_smart_vehicles'] = result
         
+        # =====================================================================
+        # SUCCESS
+        # =====================================================================
         end_time = datetime.now(timezone.utc)
         results['status'] = 'completed'
         results['completed_at'] = end_time.isoformat()
@@ -636,6 +691,8 @@ def sync_motor_data():
             f"""Source: {latest_zip}
 Duration: {results['duration_seconds']:.1f} seconds
 Records: {result['inserted']:,} inserted, {result['errors']:,} errors
+
+Safe sync pattern: Data validated before truncate.
 """,
             is_error=False
         )
@@ -661,6 +718,8 @@ Records: {result['inserted']:,} inserted, {result['errors']:,} errors
             f"MOTOR Smart Sync FAILED",
             f"""Error: {str(e)}
 
+IMPORTANT: Existing data was preserved (truncate only happens after successful download & validation).
+
 Please check the logs for details.
 """,
             is_error=True
@@ -676,7 +735,15 @@ Please check the logs for details.
 
 
 def sync_usventure_data():
-    """Main function to sync USVenture inventory data."""
+    """
+    Main function to sync USVenture inventory data.
+    
+    SAFE SYNC PATTERN:
+    1. Download data from FTPS
+    2. Parse and validate data (check minimum record count)
+    3. Only if validation passes: truncate and insert
+    4. If any step fails before truncate: existing data is preserved
+    """
     supabase = get_supabase()
     
     # =========================================================================
@@ -718,13 +785,40 @@ def sync_usventure_data():
         }).execute()
         log_id = log_entry.data[0]['id']
         
+        # =====================================================================
+        # STEP 1: DOWNLOAD - If this fails, existing data is preserved
+        # =====================================================================
+        logger.info("Step 1: Connecting to USVenture FTPS and downloading...")
         ftp = connect_usventure_ftps()
         csv_content = download_usventure_csv(ftp)
+        logger.info(f"  Download complete: {len(csv_content):,} bytes")
         
-        logger.info("Processing USVenture inventory...")
-        result = sync_usventure_inventory(supabase, csv_content)
+        # =====================================================================
+        # STEP 2: PARSE AND VALIDATE - If this fails, existing data is preserved
+        # =====================================================================
+        logger.info("Step 2: Parsing and validating data...")
+        prepared_records = prepare_usventure_data(csv_content)
+        
+        # Validate minimum record count
+        if len(prepared_records) < Config.MIN_USVENTURE_RECORDS:
+            raise ValueError(
+                f"Data validation failed: Only {len(prepared_records):,} unique parts found, "
+                f"minimum required is {Config.MIN_USVENTURE_RECORDS:,}. "
+                f"Aborting to preserve existing data."
+            )
+        
+        logger.info(f"  Validation passed: {len(prepared_records):,} unique parts ready")
+        
+        # =====================================================================
+        # STEP 3: TRUNCATE AND INSERT - Only reached if download & validation passed
+        # =====================================================================
+        logger.info("Step 3: Truncating table and inserting new data...")
+        result = insert_usventure_inventory(supabase, prepared_records)
         results['sync_result'] = result
         
+        # =====================================================================
+        # SUCCESS
+        # =====================================================================
         end_time = datetime.now(timezone.utc)
         results['status'] = 'completed'
         results['completed_at'] = end_time.isoformat()
@@ -732,7 +826,7 @@ def sync_usventure_data():
         
         supabase.table('tire_data_sync_log').update({
             'status': 'completed',
-            'records_processed': result['total_rows'],
+            'records_processed': len(prepared_records),
             'records_inserted': result['inserted'],
             'completed_at': end_time.isoformat()
         }).eq('id', log_id).execute()
@@ -741,7 +835,6 @@ def sync_usventure_data():
             f"USVenture Inventory Sync Complete",
             f"""Source: {Config.USVENTURE_FILENAME}
 Duration: {results['duration_seconds']:.1f} seconds
-Total Rows: {result['total_rows']:,}
 Unique Parts: {result['unique_parts']:,}
 Inserted: {result['inserted']:,}
 Errors: {result['errors']:,}
@@ -749,6 +842,8 @@ Errors: {result['errors']:,}
 Warehouse Breakdown:
 - Fresno (4703): Aggregated
 - Santa Clarita (4708): Aggregated
+
+Safe sync pattern: Data validated before truncate.
 """,
             is_error=False
         )
@@ -773,6 +868,8 @@ Warehouse Breakdown:
         send_alert(
             f"USVenture Inventory Sync FAILED",
             f"""Error: {str(e)}
+
+IMPORTANT: Existing data was preserved (truncate only happens after successful download & validation).
 
 Please check the logs for details.
 """,
@@ -799,7 +896,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '2.2',
+        'version': '2.3',
         'timestamp': datetime.now(timezone.utc).isoformat()
     })
 
