@@ -15,5 +15,8 @@ paramiko==3.4.0
 # Email alerts
 sendgrid==6.11.0
 
+# Direct Postgres connection (used for EWT bulk COPY inserts)
+psycopg2-binary==2.9.9
+
 # Utilities
 python-dotenv==1.0.0
