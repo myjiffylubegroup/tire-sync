@@ -1,5 +1,5 @@
 """
-TIRE SYNC SERVICE - v2.4
+TIRE SYNC SERVICE - v2.5
 =========================
 Syncs tire data from MOTOR and USVenture to Supabase.
 
@@ -17,6 +17,8 @@ Environment Variables Required:
 - SYNC_API_KEY (optional)
 
 Changelog:
+- v2.5 (2026-02-18): SFTP timeout hardening - explicit connect/channel timeouts,
+                      keepalive packets, exponential backoff (30/60/120/240s), 4 retry attempts
 - v2.4 (2026-02-05): Added automatic retry logic (3 attempts, 30s delay) for connection failures
 - v2.3 (2026-02-05): CRITICAL FIX - Download and validate data BEFORE truncating tables
 - v2.2 (2026-01-28): Added sync locking to prevent concurrent runs
@@ -34,6 +36,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from ftplib import FTP_TLS
 
+import socket
 import paramiko
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
@@ -91,8 +94,12 @@ class Config:
     MIN_USVENTURE_RECORDS = 5000  # USVenture file should have ~12k unique parts
     
     # Retry settings
-    MAX_RETRY_ATTEMPTS = 3
-    RETRY_DELAY_SECONDS = 30
+    MAX_RETRY_ATTEMPTS = 4
+    RETRY_DELAY_SECONDS = 30  # Base delay (exponential backoff: 30, 60, 120, 240)
+    
+    # SFTP/FTPS timeout settings (seconds)
+    SFTP_CONNECT_TIMEOUT = 30       # Max time to establish SSH/FTP connection
+    SFTP_CHANNEL_TIMEOUT = 180      # Max time for file download operations
 
 
 def get_supabase() -> Client:
@@ -245,12 +252,21 @@ def send_alert(subject: str, body: str, is_error: bool = False):
 # =============================================================================
 
 def connect_motor_sftp():
-    """Establish SFTP connection to MOTOR."""
+    """Establish SFTP connection to MOTOR with explicit timeouts."""
     logger.info(f"Connecting to MOTOR SFTP: {Config.MOTOR_FTP_HOST}")
     
-    transport = paramiko.Transport((Config.MOTOR_FTP_HOST, 22))
+    # Create socket with explicit connect timeout (prevents indefinite hangs)
+    sock = socket.create_connection(
+        (Config.MOTOR_FTP_HOST, 22),
+        timeout=Config.SFTP_CONNECT_TIMEOUT
+    )
+    
+    transport = paramiko.Transport(sock)
+    transport.set_keepalive(15)  # Send keepalive every 15s to prevent idle drops
     transport.connect(username=Config.MOTOR_FTP_USER, password=Config.MOTOR_FTP_PASSWORD)
+    
     sftp = paramiko.SFTPClient.from_transport(transport)
+    sftp.get_channel().settimeout(Config.SFTP_CHANNEL_TIMEOUT)  # Timeout on file operations
     
     return sftp, transport
 
@@ -328,8 +344,9 @@ def download_motor_data_with_retry() -> tuple:
             logger.warning(f"  Attempt {attempt} failed: {str(e)}")
             
             if attempt < Config.MAX_RETRY_ATTEMPTS:
-                logger.info(f"  Waiting {Config.RETRY_DELAY_SECONDS} seconds before retry...")
-                time.sleep(Config.RETRY_DELAY_SECONDS)
+                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))  # 30, 60, 120, 240
+                logger.info(f"  Waiting {delay} seconds before retry (exponential backoff)...")
+                time.sleep(delay)
             
         finally:
             if sftp:
@@ -352,11 +369,11 @@ def download_motor_data_with_retry() -> tuple:
 # =============================================================================
 
 def connect_usventure_ftps():
-    """Establish FTPS connection to USVenture."""
+    """Establish FTPS connection to USVenture with explicit timeout."""
     logger.info(f"Connecting to USVenture FTPS: {Config.USVENTURE_FTP_HOST}")
     
     ftp = FTP_TLS()
-    ftp.connect(Config.USVENTURE_FTP_HOST, 21)
+    ftp.connect(Config.USVENTURE_FTP_HOST, 21, timeout=Config.SFTP_CONNECT_TIMEOUT)
     ftp.login(Config.USVENTURE_FTP_USER, Config.USVENTURE_FTP_PASSWORD)
     ftp.prot_p()  # Switch to secure data connection
     
@@ -410,8 +427,9 @@ def download_usventure_data_with_retry() -> str:
             logger.warning(f"  Attempt {attempt} failed: {str(e)}")
             
             if attempt < Config.MAX_RETRY_ATTEMPTS:
-                logger.info(f"  Waiting {Config.RETRY_DELAY_SECONDS} seconds before retry...")
-                time.sleep(Config.RETRY_DELAY_SECONDS)
+                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))  # 30, 60, 120, 240
+                logger.info(f"  Waiting {delay} seconds before retry (exponential backoff)...")
+                time.sleep(delay)
             
         finally:
             if ftp:
@@ -979,11 +997,15 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '2.4',
+        'version': '2.5',
         'features': {
             'auto_retry': True,
             'max_attempts': Config.MAX_RETRY_ATTEMPTS,
-            'retry_delay_seconds': Config.RETRY_DELAY_SECONDS,
+            'retry_delay_base_seconds': Config.RETRY_DELAY_SECONDS,
+            'retry_strategy': 'exponential_backoff',
+            'sftp_connect_timeout': Config.SFTP_CONNECT_TIMEOUT,
+            'sftp_channel_timeout': Config.SFTP_CHANNEL_TIMEOUT,
+            'keepalive_interval': 15,
             'safe_sync_pattern': True
         },
         'timestamp': datetime.now(timezone.utc).isoformat()
