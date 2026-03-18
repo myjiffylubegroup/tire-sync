@@ -1,5 +1,5 @@
 """
-TIRE SYNC SERVICE - v3.0
+TIRE SYNC SERVICE - v3.1
 =========================
 Syncs tire data from MOTOR and USVenture to Supabase.
 
@@ -18,9 +18,11 @@ Environment Variables Required:
 - SYNC_API_KEY (optional)
 
 Changelog:
-- v3.0 (2026-03-18): Added MOTOR GEN4.5 Mechanical EWT sync (/sync/ewt)
-                      Loads all 150+ make files into ewt_labor + ewt_applications tables.
-                      Enables BrakeFinder and general mechanical estimating system.
+- v3.1 (2026-03-18): EWT streaming rewrite - process one make at a time to fix OOM.
+                      Peak memory now = zip buffer (~254MB) + one make's records.
+                      Confirmed dataset: 57 makes, ~1.3M labor + application records.
+- v3.0 (2026-03-18): Added MOTOR GEN4.5 Mechanical EWT sync (/sync/ewt).
+                      Loads all make files into ewt_labor + ewt_applications tables.
 - v2.5 (2026-02-18): SFTP timeout hardening - explicit connect/channel timeouts,
                       keepalive packets, exponential backoff (30/60/120/240s), 4 retry attempts
 - v2.4 (2026-02-05): Added automatic retry logic (3 attempts, 30s delay) for connection failures
@@ -29,6 +31,7 @@ Changelog:
 - v2.1: Added USVenture inventory sync endpoint
 """
 
+import gc
 import os
 import io
 import re
@@ -92,13 +95,14 @@ class Config:
     WAREHOUSE_SANTA_CLARITA = '4708'
 
     # Sync lock settings
-    SYNC_LOCK_TIMEOUT_MINUTES = 10  # Consider a sync "stuck" after this many minutes
+    # EWT sync can run 5-15 min — use longer stale threshold than other syncs
+    SYNC_LOCK_TIMEOUT_MINUTES = 120
 
-    # Minimum record thresholds for validation (prevents loading empty/corrupt files)
-    MIN_MOTOR_RECORDS = 100000       # MOTOR TireTech file should have ~124k records
-    MIN_USVENTURE_RECORDS = 5000     # USVenture file should have ~12k unique parts
-    MIN_EWT_LABOR_RECORDS = 500000   # EWT labor across all makes (conservative floor)
-    MIN_EWT_APPLICATION_RECORDS = 500000  # EWT applications across all makes
+    # Minimum record thresholds for validation
+    MIN_MOTOR_RECORDS = 100000      # MOTOR TireTech file should have ~124k records
+    MIN_USVENTURE_RECORDS = 5000    # USVenture file should have ~12k unique parts
+    MIN_EWT_MAKE_FILES = 50         # EWT zip should have at least 50 make pairs
+                                    # (confirmed 57 makes in Jan 2026 dataset)
 
     # Retry settings
     MAX_RETRY_ATTEMPTS = 4
@@ -107,7 +111,7 @@ class Config:
     # SFTP/FTPS timeout settings (seconds)
     SFTP_CONNECT_TIMEOUT = 30       # Max time to establish SSH/FTP connection
     SFTP_CHANNEL_TIMEOUT = 600      # Max time for file download operations
-                                    # NOTE: EWT zip is ~254MB - needs longer timeout than TireTech
+                                    # EWT zip is ~254MB - needs longer timeout
 
 
 def get_supabase() -> Client:
@@ -151,7 +155,6 @@ def check_sync_lock(supabase: Client, sync_type: str) -> dict:
     """
     timeout_threshold = datetime.now(timezone.utc) - timedelta(minutes=Config.SYNC_LOCK_TIMEOUT_MINUTES)
 
-    # Check for any running syncs of this type
     result = supabase.table('tire_data_sync_log')\
         .select('id, started_at, status')\
         .eq('sync_type', sync_type)\
@@ -161,15 +164,12 @@ def check_sync_lock(supabase: Client, sync_type: str) -> dict:
         .execute()
 
     if not result.data:
-        # No running syncs, we're clear
         return {'locked': False, 'message': 'No active sync', 'stale_id': None}
 
     running_sync = result.data[0]
     started_at_str = running_sync['started_at']
 
-    # Parse the timestamp
     if isinstance(started_at_str, str):
-        # Handle various timestamp formats
         started_at_str = started_at_str.replace('+00:00', '+0000').replace('Z', '+0000')
         try:
             started_at = datetime.strptime(started_at_str[:26] + started_at_str[-5:], '%Y-%m-%dT%H:%M:%S.%f%z')
@@ -177,17 +177,15 @@ def check_sync_lock(supabase: Client, sync_type: str) -> dict:
             try:
                 started_at = datetime.strptime(started_at_str[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
             except ValueError:
-                # If we can't parse, assume it's stale
                 logger.warning(f"Could not parse timestamp: {started_at_str}, treating as stale")
                 return {
                     'locked': False,
-                    'message': f'Found stale sync (unparseable timestamp), cleaning up',
+                    'message': 'Found stale sync (unparseable timestamp), cleaning up',
                     'stale_id': running_sync['id']
                 }
     else:
         started_at = started_at_str
 
-    # Check if the running sync is stale (older than timeout threshold)
     if started_at < timeout_threshold:
         logger.warning(f"Found stale sync lock (ID: {running_sync['id']}, started: {started_at})")
         return {
@@ -196,7 +194,6 @@ def check_sync_lock(supabase: Client, sync_type: str) -> dict:
             'stale_id': running_sync['id']
         }
 
-    # There's an active, recent sync running
     minutes_running = (datetime.now(timezone.utc) - started_at).total_seconds() / 60
     return {
         'locked': True,
@@ -263,18 +260,17 @@ def connect_motor_sftp():
     """Establish SFTP connection to MOTOR with explicit timeouts."""
     logger.info(f"Connecting to MOTOR SFTP: {Config.MOTOR_FTP_HOST}")
 
-    # Create socket with explicit connect timeout (prevents indefinite hangs)
     sock = socket.create_connection(
         (Config.MOTOR_FTP_HOST, 22),
         timeout=Config.SFTP_CONNECT_TIMEOUT
     )
 
     transport = paramiko.Transport(sock)
-    transport.set_keepalive(15)  # Send keepalive every 15s to prevent idle drops
+    transport.set_keepalive(15)
     transport.connect(username=Config.MOTOR_FTP_USER, password=Config.MOTOR_FTP_PASSWORD)
 
     sftp = paramiko.SFTPClient.from_transport(transport)
-    sftp.get_channel().settimeout(Config.SFTP_CHANNEL_TIMEOUT)  # Timeout on file operations
+    sftp.get_channel().settimeout(Config.SFTP_CHANNEL_TIMEOUT)
 
     return sftp, transport
 
@@ -327,9 +323,6 @@ def download_motor_data_with_retry() -> tuple:
 
     Returns:
         tuple: (csv_content: str, source_file: str)
-
-    Raises:
-        Exception: After all retry attempts exhausted
     """
     last_error = None
 
@@ -352,7 +345,7 @@ def download_motor_data_with_retry() -> tuple:
             logger.warning(f"  Attempt {attempt} failed: {str(e)}")
 
             if attempt < Config.MAX_RETRY_ATTEMPTS:
-                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))  # 30, 60, 120, 240
+                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
                 logger.info(f"  Waiting {delay} seconds before retry (exponential backoff)...")
                 time.sleep(delay)
 
@@ -368,7 +361,6 @@ def download_motor_data_with_retry() -> tuple:
                 except:
                     pass
 
-    # All retries exhausted
     raise Exception(f"MOTOR download failed after {Config.MAX_RETRY_ATTEMPTS} attempts. Last error: {str(last_error)}")
 
 
@@ -383,7 +375,7 @@ def connect_usventure_ftps():
     ftp = FTP_TLS()
     ftp.connect(Config.USVENTURE_FTP_HOST, 21, timeout=Config.SFTP_CONNECT_TIMEOUT)
     ftp.login(Config.USVENTURE_FTP_USER, Config.USVENTURE_FTP_PASSWORD)
-    ftp.prot_p()  # Switch to secure data connection
+    ftp.prot_p()
 
     logger.info("USVenture FTPS connection established")
     return ftp
@@ -399,7 +391,6 @@ def download_usventure_csv(ftp) -> str:
     ftp.retrbinary(f'RETR {Config.USVENTURE_FILENAME}', csv_buffer.write)
     csv_buffer.seek(0)
 
-    # Decode the CSV content
     content = csv_buffer.read().decode('utf-8-sig')
     logger.info(f"Downloaded {len(content)} bytes")
 
@@ -412,9 +403,6 @@ def download_usventure_data_with_retry() -> str:
 
     Returns:
         str: CSV content
-
-    Raises:
-        Exception: After all retry attempts exhausted
     """
     last_error = None
 
@@ -435,7 +423,7 @@ def download_usventure_data_with_retry() -> str:
             logger.warning(f"  Attempt {attempt} failed: {str(e)}")
 
             if attempt < Config.MAX_RETRY_ATTEMPTS:
-                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))  # 30, 60, 120, 240
+                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
                 logger.info(f"  Waiting {delay} seconds before retry (exponential backoff)...")
                 time.sleep(delay)
 
@@ -449,12 +437,11 @@ def download_usventure_data_with_retry() -> str:
                     except:
                         pass
 
-    # All retries exhausted
     raise Exception(f"USVenture download failed after {Config.MAX_RETRY_ATTEMPTS} attempts. Last error: {str(last_error)}")
 
 
 # =============================================================================
-# DATA SYNC - MOTOR (shared utility)
+# SHARED DATA UTILITY
 # =============================================================================
 
 def clean_value(value, field_type='string'):
@@ -570,11 +557,9 @@ def insert_smart_vehicles(supabase: Client, records: list) -> dict:
     errors = 0
     total_records = len(records)
 
-    # NOW we truncate - only after we have validated data ready
     logger.info("  Truncating tt_smart_vehicles...")
     supabase.table('tt_smart_vehicles').delete().neq('created_at', '1900-01-01').execute()
 
-    # Insert in batches
     for i in range(0, total_records, batch_size):
         batch = records[i:i + batch_size]
         try:
@@ -601,8 +586,6 @@ def prepare_usventure_data(csv_content: str) -> list:
     Does NOT touch the database - just prepares the data.
     """
     total_records = 0
-
-    # Dictionary to aggregate by part_number
     inventory_map = {}
 
     reader = csv.DictReader(io.StringIO(csv_content))
@@ -622,7 +605,6 @@ def prepare_usventure_data(csv_content: str) -> list:
         warehouse_code = row.get('D365WarehouseCode', '').strip()
         quantity = clean_value(row.get('QuantityAvailable', '0'), 'numeric') or 0
 
-        # If we haven't seen this part number yet, create the record
         if part_number not in inventory_map:
             inventory_map[part_number] = {
                 'part_number': part_number,
@@ -662,13 +644,11 @@ def prepare_usventure_data(csv_content: str) -> list:
                 'last_synced_at': datetime.now(timezone.utc).isoformat(),
             }
 
-        # Add quantity to appropriate warehouse
         if warehouse_code == Config.WAREHOUSE_FRESNO:
             inventory_map[part_number]['qty_fresno'] += quantity
         elif warehouse_code == Config.WAREHOUSE_SANTA_CLARITA:
             inventory_map[part_number]['qty_santa_clarita'] += quantity
         else:
-            # Unknown warehouse - add to general quantity
             inventory_map[part_number]['qty_fresno'] += quantity
             logger.warning(f"  Unknown warehouse code: {warehouse_code} for part {part_number}")
 
@@ -688,11 +668,9 @@ def insert_usventure_inventory(supabase: Client, records: list) -> dict:
     errors = 0
     total_records = len(records)
 
-    # NOW we truncate - only after we have validated data ready
     logger.info("  Truncating tire_inventory...")
     supabase.table('tire_inventory').delete().neq('created_at', '1900-01-01').execute()
 
-    # Insert in batches
     for i in range(0, total_records, batch_size):
         batch = records[i:i + batch_size]
         try:
@@ -718,15 +696,14 @@ def insert_usventure_inventory(supabase: Client, records: list) -> dict:
 
 def find_latest_ewt_zip(sftp) -> str:
     """
-    Find the latest Mechanical_EWT_ACES_*.zip file in the GEN4.5_MechLabor directory.
-    Falls back to any .zip file if date-stamped pattern not found.
+    Find the latest Mechanical_EWT_ACES_*.zip in the GEN4.5_MechLabor directory.
+    Falls back to any .zip if date-stamped pattern not found.
     """
     sftp.chdir(Config.MOTOR_EWT_PATH)
     files = sftp.listdir()
 
     logger.info(f"  Files in EWT directory: {files}")
 
-    # Primary pattern: Mechanical_EWT_ACES_YYYYMMDD.zip
     pattern = re.compile(r'^Mechanical_EWT_ACES_(\d{8})\.zip$', re.IGNORECASE)
     zip_files = []
 
@@ -742,106 +719,93 @@ def find_latest_ewt_zip(sftp) -> str:
         logger.info(f"  Found latest EWT file: {latest_file}")
         return latest_file
 
-    # Fallback: any .zip file in the directory (handles naming variations)
     zip_fallback = [f for f in files if f.lower().endswith('.zip')]
     if zip_fallback:
-        logger.info(f"  Date-stamped pattern not found, using fallback: {zip_fallback[0]}")
+        logger.info(f"  Using fallback zip: {zip_fallback[0]}")
         return zip_fallback[0]
 
     raise FileNotFoundError(
-        f"No EWT zip file found in {Config.MOTOR_EWT_PATH}. "
-        f"Files present: {files}"
+        f"No EWT zip file found in {Config.MOTOR_EWT_PATH}. Files present: {files}"
     )
 
 
-def download_and_extract_ewt_zip(sftp, filename: str) -> dict:
+def download_ewt_zip_to_buffer(sftp, filename: str) -> tuple:
     """
-    Download EWT zip and extract all make files.
+    Download EWT zip into memory and build an index of make pairs.
 
-    The zip contains 150+ files per make:
-      - [MAKE].txt                          (labor operations - pipe delimited)
-      - [MAKE]_Application.txt              (vehicle application links - pipe delimited)
-      - [MAKE]_Application_VCdbAttribute_xRef.txt  (engine attributes - SKIPPED in v1)
+    The full zip bytes are held in RAM (~254MB). Individual make file contents
+    are NOT decoded here — they are read one at a time during streaming insert.
 
     Returns:
-        dict: {
-            'labor': {make_name: content_string, ...},
-            'applications': {make_name: content_string, ...},
-            'source_file': filename,
-            'total_files': int,
-            'skipped_files': [str, ...]
-        }
+        tuple: (
+            zip_bytes: bytes,
+            source_file: str,
+            make_pairs: list of (make_name, labor_zip_path, app_zip_path)
+        )
     """
-    logger.info(f"  Downloading EWT zip: {filename} (this may take several minutes)...")
+    logger.info(f"  Downloading EWT zip: {filename} (~254MB, may take a minute)...")
 
     zip_buffer = io.BytesIO()
     sftp.getfo(filename, zip_buffer)
-    zip_buffer.seek(0)
-    logger.info(f"  Download complete: {zip_buffer.getbuffer().nbytes:,} bytes")
+    zip_bytes = zip_buffer.getvalue()
+    logger.info(f"  Download complete: {len(zip_bytes):,} bytes")
 
-    labor_files = {}       # make_name -> pipe-delimited text content
-    application_files = {} # make_name -> pipe-delimited text content
-    skipped_files = []
-    total_files = 0
+    make_pairs = []
+    skipped = []
 
-    with zipfile.ZipFile(zip_buffer, 'r') as zf:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
         all_names = zf.namelist()
-        logger.info(f"  Zip contains {len(all_names)} files")
+        logger.info(f"  Zip contains {len(all_names)} entries")
 
-        for name in all_names:
-            total_files += 1
-            basename = os.path.basename(name)
+        # Build a basename → full path lookup
+        name_map = {}
+        for full_path in all_names:
+            basename = os.path.basename(full_path)
+            if basename:
+                name_map[basename] = full_path
 
-            # Skip non-.txt files (PDFs, release notes, etc.)
+        # Find all labor files and pair with their application file
+        for basename, full_path in name_map.items():
             if not basename.lower().endswith('.txt'):
-                skipped_files.append(basename)
+                skipped.append(basename)
                 continue
-
-            # Skip VCdbAttribute xRef files (engine disambiguation - Phase 2)
             if '_Application_VCdbAttribute_xRef' in basename:
-                skipped_files.append(basename)
+                # Skip engine disambiguation files (Phase 2)
+                skipped.append(basename)
+                continue
+            if '_Application.txt' in basename:
+                # Will be paired from the labor side
                 continue
 
-            # Skip empty files (e.g. Yugo at 80 bytes - no real content)
-            file_bytes = zf.read(name)
-            if len(file_bytes) < 100:
-                logger.info(f"  Skipping near-empty file: {basename} ({len(file_bytes)} bytes)")
-                skipped_files.append(basename)
+            # This is a labor file: e.g. "FIAT.txt"
+            make_name = basename[:-len('.txt')]
+            app_basename = f"{make_name}_Application.txt"
+            app_path = name_map.get(app_basename)
+
+            if not app_path:
+                logger.warning(f"  No application file found for {make_name}, skipping")
+                skipped.append(basename)
                 continue
 
-            content = file_bytes.decode('utf-8-sig')
+            # Skip near-empty files (e.g. Yugo at 80 bytes)
+            labor_info = zf.getinfo(full_path)
+            if labor_info.file_size < 100:
+                logger.info(f"  Skipping near-empty file: {basename} ({labor_info.file_size} bytes)")
+                skipped.append(basename)
+                continue
 
-            # Classify as Application or Labor file
-            if basename.endswith('_Application.txt'):
-                # Extract make name: "FIAT_Application.txt" -> "FIAT"
-                make_name = basename[:-len('_Application.txt')]
-                application_files[make_name] = content
-            else:
-                # Labor file: "FIAT.txt" -> "FIAT"
-                make_name = basename[:-len('.txt')]
-                labor_files[make_name] = content
+            make_pairs.append((make_name, full_path, app_path))
 
-    logger.info(f"  Extracted: {len(labor_files)} labor files, {len(application_files)} application files")
-    logger.info(f"  Skipped: {len(skipped_files)} files")
-
-    return {
-        'labor': labor_files,
-        'applications': application_files,
-        'source_file': filename,
-        'total_files': total_files,
-        'skipped_files': skipped_files
-    }
+    logger.info(f"  Indexed {len(make_pairs)} make pairs, {len(skipped)} skipped")
+    return zip_bytes, filename, make_pairs
 
 
-def download_ewt_data_with_retry() -> dict:
+def download_ewt_data_with_retry() -> tuple:
     """
-    Download MOTOR EWT data with automatic retry on connection failures.
+    Download MOTOR EWT zip with automatic retry on connection failures.
 
     Returns:
-        dict: Result from download_and_extract_ewt_zip
-
-    Raises:
-        Exception: After all retry attempts exhausted
+        tuple: (zip_bytes: bytes, source_file: str, make_pairs: list)
     """
     last_error = None
 
@@ -854,17 +818,17 @@ def download_ewt_data_with_retry() -> dict:
 
             sftp, transport = connect_motor_sftp()
             latest_zip = find_latest_ewt_zip(sftp)
-            extracted = download_and_extract_ewt_zip(sftp, latest_zip)
+            zip_bytes, source_file, make_pairs = download_ewt_zip_to_buffer(sftp, latest_zip)
 
             logger.info(f"  EWT download successful on attempt {attempt}")
-            return extracted
+            return zip_bytes, source_file, make_pairs
 
         except Exception as e:
             last_error = e
             logger.warning(f"  Attempt {attempt} failed: {str(e)}")
 
             if attempt < Config.MAX_RETRY_ATTEMPTS:
-                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))  # 30, 60, 120, 240
+                delay = Config.RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
                 logger.info(f"  Waiting {delay} seconds before retry (exponential backoff)...")
                 time.sleep(delay)
 
@@ -880,217 +844,111 @@ def download_ewt_data_with_retry() -> dict:
                 except:
                     pass
 
-    # All retries exhausted
     raise Exception(f"EWT download failed after {Config.MAX_RETRY_ATTEMPTS} attempts. Last error: {str(last_error)}")
 
 
-def prepare_ewt_labor_data(labor_files: dict) -> list:
+def parse_ewt_labor_file(make_name: str, content: str) -> list:
     """
-    Parse all [Make].txt labor files and flatten into a single list of records.
+    Parse one [Make].txt labor file into records for ewt_labor.
 
-    Each record maps to one row in ewt_labor table.
-    make_name is denormalized from the filename so queries don't need a join.
-
-    The pipe-delimited columns are:
+    Pipe-delimited columns:
       MechanicalEstimatingID | Motor_DB_Section | Motor_DB_Group | Motor_DB_SubGroup |
       Motor_DB_Operation | QualifierDescription | FactoryTime | MOTORTime |
       IsAdditionalOperation | SectionApplication | MOTOR_DB_Description |
       SkillCode | Motor_DB_Footnote
     """
-    all_records = []
-    makes_processed = 0
-    makes_failed = 0
+    records = []
+    reader = csv.DictReader(io.StringIO(content), delimiter='|')
 
-    for make_name, content in labor_files.items():
-        try:
-            reader = csv.DictReader(io.StringIO(content), delimiter='|')
-            make_records = 0
+    for row in reader:
+        normalized = {k.strip().lstrip('\ufeff'): (v.strip() if v else v)
+                      for k, v in row.items()}
 
-            for row in reader:
-                # Strip BOM and whitespace from all keys/values
-                normalized = {k.strip().lstrip('\ufeff'): v.strip() if v else v
-                              for k, v in row.items()}
+        mechanical_estimating_id = clean_value(
+            normalized.get('MechanicalEstimatingID'), 'bigint'
+        )
+        if not mechanical_estimating_id:
+            continue
 
-                mechanical_estimating_id = clean_value(
-                    normalized.get('MechanicalEstimatingID'), 'bigint'
-                )
-                if not mechanical_estimating_id:
-                    continue  # Skip malformed rows
+        records.append({
+            'mechanical_estimating_id': mechanical_estimating_id,
+            'make_name': make_name,
+            'motor_db_section': clean_value(normalized.get('Motor_DB_Section'), 'string'),
+            'motor_db_group': clean_value(normalized.get('Motor_DB_Group'), 'string'),
+            'motor_db_subgroup': clean_value(normalized.get('Motor_DB_SubGroup'), 'string'),
+            'motor_db_operation': clean_value(normalized.get('Motor_DB_Operation'), 'string'),
+            'qualifier_description': clean_value(normalized.get('QualifierDescription'), 'string'),
+            'factory_time': clean_value(normalized.get('FactoryTime'), 'numeric'),
+            'motor_time': clean_value(normalized.get('MOTORTime'), 'numeric'),
+            'is_additional_operation': (
+                normalized.get('IsAdditionalOperation', 'No').strip().lower() == 'yes'
+            ),
+            'section_application': clean_value(normalized.get('SectionApplication'), 'string'),
+            'motor_db_description': clean_value(normalized.get('MOTOR_DB_Description'), 'string'),
+            'skill_code': clean_value(normalized.get('SkillCode'), 'string'),
+            'motor_db_footnote': clean_value(normalized.get('Motor_DB_Footnote'), 'string'),
+        })
 
-                record = {
-                    'mechanical_estimating_id': mechanical_estimating_id,
-                    'make_name': make_name,
-                    'motor_db_section': clean_value(normalized.get('Motor_DB_Section'), 'string'),
-                    'motor_db_group': clean_value(normalized.get('Motor_DB_Group'), 'string'),
-                    'motor_db_subgroup': clean_value(normalized.get('Motor_DB_SubGroup'), 'string'),
-                    'motor_db_operation': clean_value(normalized.get('Motor_DB_Operation'), 'string'),
-                    'qualifier_description': clean_value(normalized.get('QualifierDescription'), 'string'),
-                    'factory_time': clean_value(normalized.get('FactoryTime'), 'numeric'),
-                    'motor_time': clean_value(normalized.get('MOTORTime'), 'numeric'),
-                    'is_additional_operation': (
-                        normalized.get('IsAdditionalOperation', 'No').strip().lower() == 'yes'
-                    ),
-                    'section_application': clean_value(normalized.get('SectionApplication'), 'string'),
-                    'motor_db_description': clean_value(normalized.get('MOTOR_DB_Description'), 'string'),
-                    'skill_code': clean_value(normalized.get('SkillCode'), 'string'),
-                    'motor_db_footnote': clean_value(normalized.get('Motor_DB_Footnote'), 'string'),
-                }
-
-                all_records.append(record)
-                make_records += 1
-
-            makes_processed += 1
-            if makes_processed % 10 == 0:
-                logger.info(f"  Labor parsed: {makes_processed} makes, {len(all_records):,} records so far")
-
-        except Exception as e:
-            logger.error(f"  Failed to parse labor file for {make_name}: {e}")
-            makes_failed += 1
-
-    logger.info(
-        f"  Labor prepare complete: {makes_processed} makes processed, "
-        f"{makes_failed} failed, {len(all_records):,} total records"
-    )
-    return all_records
+    return records
 
 
-def prepare_ewt_application_data(application_files: dict) -> list:
+def parse_ewt_application_file(make_name: str, content: str) -> list:
     """
-    Parse all [Make]_Application.txt files and flatten into a single list of records.
+    Parse one [Make]_Application.txt file into records for ewt_applications.
 
-    Each record maps to one row in ewt_applications table.
-    Links MechanicalEstimatingID to BaseVehicleID (ACES VCdb).
-    BaseVehicleID joins to tt_smart_vehicles.vcdb_base_vehicle_id for YMM lookup.
-
-    The pipe-delimited columns are:
+    Pipe-delimited columns:
       ApplicationID | MechanicalEstimatingID | BaseVehicleID | RegionID |
       VehicleToEngineConfigID
+
+    BaseVehicleID joins to tt_smart_vehicles.vcdb_base_vehicle_id for YMM lookup —
+    no ACES VCdb license needed.
     """
-    all_records = []
-    makes_processed = 0
-    makes_failed = 0
+    records = []
+    reader = csv.DictReader(io.StringIO(content), delimiter='|')
 
-    for make_name, content in application_files.items():
-        try:
-            reader = csv.DictReader(io.StringIO(content), delimiter='|')
-            make_records = 0
+    for row in reader:
+        normalized = {k.strip().lstrip('\ufeff'): (v.strip() if v else v)
+                      for k, v in row.items()}
 
-            for row in reader:
-                normalized = {k.strip().lstrip('\ufeff'): v.strip() if v else v
-                              for k, v in row.items()}
+        application_id = clean_value(normalized.get('ApplicationID'), 'bigint')
+        mechanical_estimating_id = clean_value(normalized.get('MechanicalEstimatingID'), 'bigint')
+        base_vehicle_id = clean_value(normalized.get('BaseVehicleID'), 'integer')
 
-                application_id = clean_value(normalized.get('ApplicationID'), 'bigint')
-                mechanical_estimating_id = clean_value(
-                    normalized.get('MechanicalEstimatingID'), 'bigint'
-                )
-                base_vehicle_id = clean_value(normalized.get('BaseVehicleID'), 'integer')
+        if not application_id or not mechanical_estimating_id or not base_vehicle_id:
+            continue
 
-                if not application_id or not mechanical_estimating_id or not base_vehicle_id:
-                    continue  # Skip malformed rows
+        records.append({
+            'application_id': application_id,
+            'mechanical_estimating_id': mechanical_estimating_id,
+            'base_vehicle_id': base_vehicle_id,
+            'region_id': clean_value(normalized.get('RegionID'), 'integer'),
+            'vehicle_to_engine_config_id': clean_value(
+                normalized.get('VehicleToEngineConfigID'), 'integer'
+            ),
+            'make_name': make_name,  # denormalized for debugging
+        })
 
-                record = {
-                    'application_id': application_id,
-                    'mechanical_estimating_id': mechanical_estimating_id,
-                    'base_vehicle_id': base_vehicle_id,
-                    'region_id': clean_value(normalized.get('RegionID'), 'integer'),
-                    'vehicle_to_engine_config_id': clean_value(
-                        normalized.get('VehicleToEngineConfigID'), 'integer'
-                    ),
-                    'make_name': make_name,  # denormalized for debugging/filtering
-                }
-
-                all_records.append(record)
-                make_records += 1
-
-            makes_processed += 1
-            if makes_processed % 10 == 0:
-                logger.info(f"  Applications parsed: {makes_processed} makes, {len(all_records):,} records so far")
-
-        except Exception as e:
-            logger.error(f"  Failed to parse application file for {make_name}: {e}")
-            makes_failed += 1
-
-    logger.info(
-        f"  Application prepare complete: {makes_processed} makes processed, "
-        f"{makes_failed} failed, {len(all_records):,} total records"
-    )
-    return all_records
+    return records
 
 
-def insert_ewt_data(supabase: Client, labor_records: list, application_records: list) -> dict:
+def insert_batch(supabase: Client, table: str, records: list, batch_size: int = 1000) -> dict:
     """
-    Truncate both EWT tables and insert all prepared records.
-    Only called AFTER download and validation have passed.
-
-    Uses smaller batch size (1000) due to the large number of columns and
-    potential row size in the labor table.
+    Insert a list of records into a Supabase table in batches.
+    Returns {'inserted': int, 'errors': int}.
     """
-    batch_size = 1000
-    results = {}
+    inserted = 0
+    errors = 0
 
-    # =========================================================================
-    # TRUNCATE BOTH TABLES - point of no return, data is validated and ready
-    # =========================================================================
-    logger.info("  Truncating ewt_labor...")
-    supabase.table('ewt_labor').delete().neq('mechanical_estimating_id', -1).execute()
-
-    logger.info("  Truncating ewt_applications...")
-    supabase.table('ewt_applications').delete().neq('application_id', -1).execute()
-
-    # =========================================================================
-    # INSERT LABOR RECORDS
-    # =========================================================================
-    logger.info(f"  Inserting {len(labor_records):,} labor records...")
-    labor_inserted = 0
-    labor_errors = 0
-
-    for i in range(0, len(labor_records), batch_size):
-        batch = labor_records[i:i + batch_size]
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
         try:
-            supabase.table('ewt_labor').insert(batch).execute()
-            labor_inserted += len(batch)
-            if labor_inserted % 50000 == 0 or labor_inserted == len(labor_records):
-                logger.info(f"  Labor: {labor_inserted:,} / {len(labor_records):,} inserted")
+            supabase.table(table).insert(batch).execute()
+            inserted += len(batch)
         except Exception as e:
-            logger.error(f"  Labor batch error at offset {i}: {e}")
-            labor_errors += len(batch)
+            logger.error(f"  Batch insert error ({table}, offset {i}): {e}")
+            errors += len(batch)
 
-    results['labor'] = {
-        'total': len(labor_records),
-        'inserted': labor_inserted,
-        'errors': labor_errors
-    }
-
-    # =========================================================================
-    # INSERT APPLICATION RECORDS
-    # =========================================================================
-    logger.info(f"  Inserting {len(application_records):,} application records...")
-    app_inserted = 0
-    app_errors = 0
-
-    for i in range(0, len(application_records), batch_size):
-        batch = application_records[i:i + batch_size]
-        try:
-            supabase.table('ewt_applications').insert(batch).execute()
-            app_inserted += len(batch)
-            if app_inserted % 50000 == 0 or app_inserted == len(application_records):
-                logger.info(f"  Applications: {app_inserted:,} / {len(application_records):,} inserted")
-        except Exception as e:
-            logger.error(f"  Application batch error at offset {i}: {e}")
-            app_errors += len(batch)
-
-    results['applications'] = {
-        'total': len(application_records),
-        'inserted': app_inserted,
-        'errors': app_errors
-    }
-
-    logger.info(
-        f"  EWT insert complete. "
-        f"Labor: {labor_inserted:,} inserted / {labor_errors:,} errors. "
-        f"Applications: {app_inserted:,} inserted / {app_errors:,} errors."
-    )
-    return results
+    return {'inserted': inserted, 'errors': errors}
 
 
 # =============================================================================
@@ -1109,9 +967,6 @@ def sync_motor_data():
     """
     supabase = get_supabase()
 
-    # =========================================================================
-    # CHECK SYNC LOCK - Prevent concurrent runs
-    # =========================================================================
     lock_status = check_sync_lock(supabase, 'motor_tiretech_smart')
 
     if lock_status['locked']:
@@ -1122,13 +977,9 @@ def sync_motor_data():
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
-    # Clean up stale lock if found
     if lock_status['stale_id']:
         cleanup_stale_lock(supabase, lock_status['stale_id'])
 
-    # =========================================================================
-    # PROCEED WITH SYNC
-    # =========================================================================
     start_time = datetime.now(timezone.utc)
     results = {
         'status': 'running',
@@ -1147,17 +998,11 @@ def sync_motor_data():
         }).execute()
         log_id = log_entry.data[0]['id']
 
-        # =====================================================================
-        # STEP 1: DOWNLOAD WITH RETRY
-        # =====================================================================
         logger.info("Step 1: Downloading from MOTOR SFTP (with retry)...")
         csv_content, latest_zip = download_motor_data_with_retry()
         results['source_file'] = latest_zip
         logger.info(f"  Download complete: {len(csv_content):,} bytes from {latest_zip}")
 
-        # =====================================================================
-        # STEP 2: PARSE AND VALIDATE
-        # =====================================================================
         logger.info("Step 2: Parsing and validating data...")
         prepared_records = prepare_smart_vehicles_data(csv_content)
 
@@ -1170,16 +1015,10 @@ def sync_motor_data():
 
         logger.info(f"  Validation passed: {len(prepared_records):,} records ready")
 
-        # =====================================================================
-        # STEP 3: TRUNCATE AND INSERT
-        # =====================================================================
         logger.info("Step 3: Truncating table and inserting new data...")
         result = insert_smart_vehicles(supabase, prepared_records)
         results['tables']['tt_smart_vehicles'] = result
 
-        # =====================================================================
-        # SUCCESS
-        # =====================================================================
         end_time = datetime.now(timezone.utc)
         results['status'] = 'completed'
         results['completed_at'] = end_time.isoformat()
@@ -1193,7 +1032,7 @@ def sync_motor_data():
         }).eq('id', log_id).execute()
 
         send_alert(
-            f"MOTOR Smart Sync Complete",
+            "MOTOR Smart Sync Complete",
             f"""Source: {latest_zip}
 Duration: {results['duration_seconds']:.1f} seconds
 Records: {result['inserted']:,} inserted, {result['errors']:,} errors
@@ -1221,7 +1060,7 @@ Features: Auto-retry enabled ({Config.MAX_RETRY_ATTEMPTS} attempts), safe sync p
                 pass
 
         send_alert(
-            f"MOTOR Smart Sync FAILED",
+            "MOTOR Smart Sync FAILED",
             f"""Error: {str(e)}
 
 Retry attempts: {Config.MAX_RETRY_ATTEMPTS} (all exhausted)
@@ -1247,9 +1086,6 @@ def sync_usventure_data():
     """
     supabase = get_supabase()
 
-    # =========================================================================
-    # CHECK SYNC LOCK - Prevent concurrent runs
-    # =========================================================================
     lock_status = check_sync_lock(supabase, 'usventure_inventory')
 
     if lock_status['locked']:
@@ -1260,13 +1096,9 @@ def sync_usventure_data():
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
-    # Clean up stale lock if found
     if lock_status['stale_id']:
         cleanup_stale_lock(supabase, lock_status['stale_id'])
 
-    # =========================================================================
-    # PROCEED WITH SYNC
-    # =========================================================================
     start_time = datetime.now(timezone.utc)
     results = {
         'status': 'running',
@@ -1285,16 +1117,10 @@ def sync_usventure_data():
         }).execute()
         log_id = log_entry.data[0]['id']
 
-        # =====================================================================
-        # STEP 1: DOWNLOAD WITH RETRY
-        # =====================================================================
         logger.info("Step 1: Downloading from USVenture FTPS (with retry)...")
         csv_content = download_usventure_data_with_retry()
         logger.info(f"  Download complete: {len(csv_content):,} bytes")
 
-        # =====================================================================
-        # STEP 2: PARSE AND VALIDATE
-        # =====================================================================
         logger.info("Step 2: Parsing and validating data...")
         prepared_records = prepare_usventure_data(csv_content)
 
@@ -1307,16 +1133,10 @@ def sync_usventure_data():
 
         logger.info(f"  Validation passed: {len(prepared_records):,} unique parts ready")
 
-        # =====================================================================
-        # STEP 3: TRUNCATE AND INSERT
-        # =====================================================================
         logger.info("Step 3: Truncating table and inserting new data...")
         result = insert_usventure_inventory(supabase, prepared_records)
         results['sync_result'] = result
 
-        # =====================================================================
-        # SUCCESS
-        # =====================================================================
         end_time = datetime.now(timezone.utc)
         results['status'] = 'completed'
         results['completed_at'] = end_time.isoformat()
@@ -1330,7 +1150,7 @@ def sync_usventure_data():
         }).eq('id', log_id).execute()
 
         send_alert(
-            f"USVenture Inventory Sync Complete",
+            "USVenture Inventory Sync Complete",
             f"""Source: {Config.USVENTURE_FILENAME}
 Duration: {results['duration_seconds']:.1f} seconds
 Unique Parts: {result['unique_parts']:,}
@@ -1364,7 +1184,7 @@ Features: Auto-retry enabled ({Config.MAX_RETRY_ATTEMPTS} attempts), safe sync p
                 pass
 
         send_alert(
-            f"USVenture Inventory Sync FAILED",
+            "USVenture Inventory Sync FAILED",
             f"""Error: {str(e)}
 
 Retry attempts: {Config.MAX_RETRY_ATTEMPTS} (all exhausted)
@@ -1382,24 +1202,20 @@ def sync_ewt_data():
     """
     Main function to sync MOTOR GEN4.5 Mechanical EWT data.
 
-    Loads all 150+ make files into ewt_labor and ewt_applications tables.
-    This is the data foundation for BrakeFinder and future mechanical estimating.
+    STREAMING PATTERN — one make at a time to keep memory flat:
+    1. Download zip into buffer (~254MB, held in RAM throughout)
+    2. Build index of make pairs from zip directory (no file contents yet)
+    3. Validate: must have >= MIN_EWT_MAKE_FILES make pairs
+    4. Truncate both ewt_labor and ewt_applications
+    5. For each make: read from zip → parse labor → insert → parse apps → insert → gc
+       Peak memory = zip buffer + one make's parsed records at any point
 
-    SAFE SYNC PATTERN with RETRY:
-    1. Download and extract EWT zip from MOTOR SFTP (with up to 4 retry attempts)
-    2. Parse all make files and validate minimum record counts
-    3. Only if validation passes: truncate both tables and insert
-    4. If any step fails before truncate: existing data is preserved
-
-    NOTE: This sync is large (~5-15M rows total) and will take 20-60 minutes.
-    It should be triggered monthly via Zapier, same cadence as MOTOR TireTech.
-    The HTTP response returns immediately; processing continues in the background.
+    Triggered monthly via Zapier. Runtime: ~5-15 minutes for 57 makes.
     """
     supabase = get_supabase()
 
     # =========================================================================
-    # CHECK SYNC LOCK - Prevent concurrent runs
-    # EWT sync is slow - extra important to prevent overlapping runs
+    # CHECK SYNC LOCK
     # =========================================================================
     lock_status = check_sync_lock(supabase, 'motor_ewt')
 
@@ -1411,13 +1227,9 @@ def sync_ewt_data():
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
-    # Clean up stale lock if found
     if lock_status['stale_id']:
         cleanup_stale_lock(supabase, lock_status['stale_id'])
 
-    # =========================================================================
-    # PROCEED WITH SYNC
-    # =========================================================================
     start_time = datetime.now(timezone.utc)
     results = {
         'status': 'running',
@@ -1437,61 +1249,86 @@ def sync_ewt_data():
         log_id = log_entry.data[0]['id']
 
         # =====================================================================
-        # STEP 1: DOWNLOAD AND EXTRACT WITH RETRY
-        # Large zip - uses extended SFTP_CHANNEL_TIMEOUT (600s)
+        # STEP 1: DOWNLOAD ZIP + BUILD MAKE INDEX
+        # Holds ~254MB zip in RAM. No file contents decoded yet.
         # =====================================================================
         logger.info("Step 1: Downloading EWT zip from MOTOR SFTP (with retry)...")
-        extracted = download_ewt_data_with_retry()
-        results['source_file'] = extracted['source_file']
-
-        labor_files = extracted['labor']
-        application_files = extracted['applications']
-
-        logger.info(
-            f"  Extraction complete: {len(labor_files)} labor files, "
-            f"{len(application_files)} application files, "
-            f"{len(extracted['skipped_files'])} skipped"
-        )
+        zip_bytes, source_file, make_pairs = download_ewt_data_with_retry()
+        results['source_file'] = source_file
+        logger.info(f"  Indexed {len(make_pairs)} make pairs from {source_file}")
 
         # =====================================================================
-        # STEP 2: PARSE ALL FILES
+        # STEP 2: VALIDATE FILE COUNT (pre-truncate safety gate)
         # =====================================================================
-        logger.info("Step 2: Parsing labor files...")
-        labor_records = prepare_ewt_labor_data(labor_files)
-
-        logger.info("Step 2: Parsing application files...")
-        application_records = prepare_ewt_application_data(application_files)
-
-        # =====================================================================
-        # STEP 2b: VALIDATE MINIMUM RECORD COUNTS
-        # If the dataset looks suspiciously small, abort before touching tables
-        # =====================================================================
-        if len(labor_records) < Config.MIN_EWT_LABOR_RECORDS:
+        if len(make_pairs) < Config.MIN_EWT_MAKE_FILES:
             raise ValueError(
-                f"EWT labor validation failed: Only {len(labor_records):,} records found, "
-                f"minimum required is {Config.MIN_EWT_LABOR_RECORDS:,}. "
+                f"EWT validation failed: Only {len(make_pairs)} make files found, "
+                f"minimum required is {Config.MIN_EWT_MAKE_FILES}. "
                 f"Aborting to preserve existing data."
             )
 
-        if len(application_records) < Config.MIN_EWT_APPLICATION_RECORDS:
-            raise ValueError(
-                f"EWT application validation failed: Only {len(application_records):,} records found, "
-                f"minimum required is {Config.MIN_EWT_APPLICATION_RECORDS:,}. "
-                f"Aborting to preserve existing data."
-            )
-
-        logger.info(
-            f"  Validation passed: "
-            f"{len(labor_records):,} labor records, "
-            f"{len(application_records):,} application records ready"
-        )
+        logger.info(f"  Validation passed: {len(make_pairs)} makes ready")
 
         # =====================================================================
-        # STEP 3: TRUNCATE AND INSERT - Point of no return
+        # STEP 3: TRUNCATE BOTH TABLES — point of no return
+        # Only reached after successful download + file count validation.
         # =====================================================================
-        logger.info("Step 3: Truncating tables and inserting new data...")
-        insert_result = insert_ewt_data(supabase, labor_records, application_records)
-        results['tables'] = insert_result
+        logger.info("Step 3: Truncating ewt_labor and ewt_applications...")
+        supabase.table('ewt_labor').delete().neq('mechanical_estimating_id', -1).execute()
+        supabase.table('ewt_applications').delete().neq('application_id', -1).execute()
+        logger.info("  Tables truncated.")
+
+        # =====================================================================
+        # STEP 4: STREAM ONE MAKE AT A TIME
+        # Read from zip → parse → insert → discard → gc → next make
+        # =====================================================================
+        total_labor_inserted = 0
+        total_labor_errors = 0
+        total_app_inserted = 0
+        total_app_errors = 0
+        makes_processed = 0
+        makes_failed = 0
+
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
+            for make_name, labor_zip_path, app_zip_path in make_pairs:
+                try:
+                    # LABOR: read → parse → insert → free
+                    labor_content = zf.read(labor_zip_path).decode('utf-8-sig')
+                    labor_records = parse_ewt_labor_file(make_name, labor_content)
+                    del labor_content
+
+                    labor_result = insert_batch(supabase, 'ewt_labor', labor_records)
+                    total_labor_inserted += labor_result['inserted']
+                    total_labor_errors += labor_result['errors']
+                    del labor_records
+                    gc.collect()
+
+                    # APPLICATIONS: read → parse → insert → free
+                    app_content = zf.read(app_zip_path).decode('utf-8-sig')
+                    app_records = parse_ewt_application_file(make_name, app_content)
+                    del app_content
+
+                    app_result = insert_batch(supabase, 'ewt_applications', app_records)
+                    total_app_inserted += app_result['inserted']
+                    total_app_errors += app_result['errors']
+                    del app_records
+                    gc.collect()
+
+                    makes_processed += 1
+                    logger.info(
+                        f"  [{makes_processed}/{len(make_pairs)}] {make_name}: "
+                        f"{labor_result['inserted']} labor, {app_result['inserted']} apps"
+                    )
+
+                except Exception as e:
+                    logger.error(f"  Failed to process make {make_name}: {e}")
+                    makes_failed += 1
+                    gc.collect()
+                    continue
+
+        # Free zip buffer now that all makes are processed
+        del zip_bytes
+        gc.collect()
 
         # =====================================================================
         # SUCCESS
@@ -1500,38 +1337,38 @@ def sync_ewt_data():
         results['status'] = 'completed'
         results['completed_at'] = end_time.isoformat()
         results['duration_seconds'] = (end_time - start_time).total_seconds()
-        results['makes_loaded'] = len(labor_files)
+        results['makes_processed'] = makes_processed
+        results['makes_failed'] = makes_failed
+        results['tables'] = {
+            'ewt_labor': {'inserted': total_labor_inserted, 'errors': total_labor_errors},
+            'ewt_applications': {'inserted': total_app_inserted, 'errors': total_app_errors}
+        }
 
-        total_inserted = (
-            insert_result['labor']['inserted'] +
-            insert_result['applications']['inserted']
-        )
+        total_inserted = total_labor_inserted + total_app_inserted
 
         supabase.table('tire_data_sync_log').update({
             'status': 'completed',
-            'source_file': extracted['source_file'],
+            'source_file': source_file,
             'records_inserted': total_inserted,
             'completed_at': end_time.isoformat()
         }).eq('id', log_id).execute()
 
         send_alert(
-            f"MOTOR EWT Sync Complete",
-            f"""Source: {extracted['source_file']}
+            "MOTOR EWT Sync Complete",
+            f"""Source: {source_file}
 Duration: {results['duration_seconds'] / 60:.1f} minutes
-Makes Loaded: {len(labor_files)}
+Makes Processed: {makes_processed} / {len(make_pairs)} ({makes_failed} failed)
 
-Labor Records:
-  Total: {insert_result['labor']['total']:,}
-  Inserted: {insert_result['labor']['inserted']:,}
-  Errors: {insert_result['labor']['errors']:,}
+ewt_labor:
+  Inserted: {total_labor_inserted:,}
+  Errors:   {total_labor_errors:,}
 
-Application Records:
-  Total: {insert_result['applications']['total']:,}
-  Inserted: {insert_result['applications']['inserted']:,}
-  Errors: {insert_result['applications']['errors']:,}
+ewt_applications:
+  Inserted: {total_app_inserted:,}
+  Errors:   {total_app_errors:,}
 
-Tables: ewt_labor, ewt_applications
 BrakeFinder and mechanical estimating data is now current.
+Memory strategy: streaming (one make at a time).
 """,
             is_error=False
         )
@@ -1554,13 +1391,13 @@ BrakeFinder and mechanical estimating data is now current.
                 pass
 
         send_alert(
-            f"MOTOR EWT Sync FAILED",
+            "MOTOR EWT Sync FAILED",
             f"""Error: {str(e)}
 
-Retry attempts: {Config.MAX_RETRY_ATTEMPTS} (all exhausted)
-Existing data: PRESERVED (truncate only happens after successful download & validation)
+Note: If failure occurred after the truncate step, ewt_labor and ewt_applications
+may be partially populated. Re-triggering the sync will truncate and reload cleanly.
 
-Please check the logs for details.
+Please check tire_data_sync_log and Render logs for details.
 """,
             is_error=True
         )
@@ -1578,7 +1415,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '3.0',
+        'version': '3.1',
         'features': {
             'auto_retry': True,
             'max_attempts': Config.MAX_RETRY_ATTEMPTS,
@@ -1588,6 +1425,7 @@ def health_check():
             'sftp_channel_timeout': Config.SFTP_CHANNEL_TIMEOUT,
             'keepalive_interval': 15,
             'safe_sync_pattern': True,
+            'ewt_memory_strategy': 'streaming_per_make',
             'syncs': ['motor_tiretech_smart', 'usventure_inventory', 'motor_ewt']
         },
         'timestamp': datetime.now(timezone.utc).isoformat()
@@ -1602,18 +1440,10 @@ def trigger_motor_sync():
 
     try:
         results = sync_motor_data()
-
-        if results.get('status') == 'skipped':
-            return jsonify(results), 200
-
         return jsonify(results), 200
-
     except Exception as e:
         logger.error(f"MOTOR sync failed: {e}")
-        return jsonify({
-            'status': 'failed',
-            'error': str(e)
-        }), 500
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
 
 
 @app.route('/sync/usventure', methods=['POST'])
@@ -1624,18 +1454,10 @@ def trigger_usventure_sync():
 
     try:
         results = sync_usventure_data()
-
-        if results.get('status') == 'skipped':
-            return jsonify(results), 200
-
         return jsonify(results), 200
-
     except Exception as e:
         logger.error(f"USVenture sync failed: {e}")
-        return jsonify({
-            'status': 'failed',
-            'error': str(e)
-        }), 500
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
 
 
 @app.route('/sync/ewt', methods=['POST'])
@@ -1644,26 +1466,19 @@ def trigger_ewt_sync():
     """
     Webhook endpoint to trigger MOTOR GEN4.5 EWT sync.
 
-    This sync is large and long-running (20-60 min for full dataset).
-    Trigger monthly via Zapier, same cadence as MOTOR TireTech.
-    Returns 200 immediately; processing continues in the background.
+    Streams one make at a time.
+    Peak memory: ~254MB zip buffer + one make's parsed records.
+    Runtime: ~5-15 minutes for 57 makes.
+    Trigger monthly via Zapier.
     """
     logger.info("MOTOR EWT sync triggered via webhook")
 
     try:
         results = sync_ewt_data()
-
-        if results.get('status') == 'skipped':
-            return jsonify(results), 200
-
         return jsonify(results), 200
-
     except Exception as e:
         logger.error(f"EWT sync failed: {e}")
-        return jsonify({
-            'status': 'failed',
-            'error': str(e)
-        }), 500
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
 
 
 @app.route('/status', methods=['GET'])
@@ -1677,9 +1492,7 @@ def sync_status():
             .limit(10)\
             .execute()
 
-        return jsonify({
-            'recent_syncs': result.data
-        })
+        return jsonify({'recent_syncs': result.data})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
