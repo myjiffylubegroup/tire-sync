@@ -1,12 +1,12 @@
 """
-TIRE SYNC SERVICE - v3.3
+TIRE SYNC SERVICE - v3.4
 =========================
 Syncs tire data from MOTOR, USVenture, and AutoCare VCdb to Supabase.
 
 Endpoints:
 - POST /sync/motor     - Sync MOTOR TireTechSmart data (vehicle fitment)
 - POST /sync/usventure - Sync USVenture inventory (pricing & stock)
-- POST /sync/ewt       - Sync MOTOR GEN4.5 Mechanical EWT (labor times)
+- POST /sync/ewt       - Sync MOTOR GEN4.5 Mechanical EWT (labor times + VCdb attribute xref)
 - POST /sync/vcdb      - Sync AutoCare VCdb (vehicle configuration for BrakeFinder)
 - GET /health          - Health check
 - GET /status          - Recent sync history
@@ -21,6 +21,14 @@ Environment Variables Required:
 - SYNC_API_KEY (optional)
 
 Changelog:
+- v3.4 (2026-04-17): EWT sync now also loads the per-make *_Application_VCdbAttribute_xRef
+                      files into ewt_applications_vcdb_attribute_xref. This table is what
+                      MOTOR ships to differentiate applications by VCdb attributes (DriveType,
+                      BrakeConfig, SubModel, etc.) — the missing piece that lets the labor
+                      search filter a 4x4 Sierra's oil pump operation correctly vs. the RWD
+                      application on the same base vehicle. Without it, DISTINCT ON collapsed
+                      multiple drivetrain applications to one arbitrary row. Xref files were
+                      previously explicitly skipped in download_ewt_zip_to_buffer; now loaded.
 - v3.3 (2026-03-21): Added AutoCare VCdb sync (/sync/vcdb) for BrakeFinder.
                       Initial load from MySQL dump via multipart file upload.
                       Parses positional INSERT statements using column order from
@@ -669,12 +677,21 @@ def find_latest_ewt_zip(sftp) -> str:
 
 def download_ewt_zip_to_buffer(sftp, filename: str) -> tuple:
     """
-    Download EWT zip into memory and build index of make pairs.
+    Download EWT zip into memory and build index of make file sets.
     File contents are NOT decoded here — read one at a time during COPY.
 
+    Each make ships three files:
+      - {Make}.txt                                labor operations
+      - {Make}_Application.txt                    base vehicle + engine config applications
+      - {Make}_Application_VCdbAttribute_xRef.txt VCdb attributes differentiating applications
+                                                  (DriveType, BrakeConfig, SubModel, etc.)
+
+    The xref file is optional — older/simpler makes may not have one. The labor
+    and application files are required.
+
     Returns:
-        tuple: (zip_bytes, source_file, make_pairs)
-        make_pairs: list of (make_name, labor_zip_path, app_zip_path)
+        tuple: (zip_bytes, source_file, make_sets)
+        make_sets: list of (make_name, labor_zip_path, app_zip_path, xref_zip_path_or_None)
     """
     logger.info(f"  Downloading EWT zip: {filename} (~254MB)...")
 
@@ -683,8 +700,10 @@ def download_ewt_zip_to_buffer(sftp, filename: str) -> tuple:
     zip_bytes = zip_buffer.getvalue()
     logger.info(f"  Download complete: {len(zip_bytes):,} bytes")
 
-    make_pairs = []
+    make_sets = []
     skipped = []
+    makes_with_xref = 0
+    makes_without_xref = 0
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
         all_names = zf.namelist()
@@ -700,15 +719,20 @@ def download_ewt_zip_to_buffer(sftp, filename: str) -> tuple:
             if not basename.lower().endswith('.txt'):
                 skipped.append(basename)
                 continue
+            # The labor file is the one that does NOT have _Application in its name.
+            # Skip the application and xref files here — they'll be picked up by
+            # their corresponding labor file below.
             if '_Application_VCdbAttribute_xRef' in basename:
-                skipped.append(basename)
                 continue
             if '_Application.txt' in basename:
                 continue
 
             make_name = basename[:-len('.txt')]
             app_basename = f"{make_name}_Application.txt"
+            xref_basename = f"{make_name}_Application_VCdbAttribute_xRef.txt"
+
             app_path = name_map.get(app_basename)
+            xref_path = name_map.get(xref_basename)  # May be None for makes without an xref
 
             if not app_path:
                 logger.warning(f"  No application file for {make_name}, skipping")
@@ -721,10 +745,20 @@ def download_ewt_zip_to_buffer(sftp, filename: str) -> tuple:
                 skipped.append(basename)
                 continue
 
-            make_pairs.append((make_name, full_path, app_path))
+            if xref_path:
+                makes_with_xref += 1
+            else:
+                makes_without_xref += 1
+                logger.info(f"  No xref file for {make_name} — will load labor + apps only")
 
-    logger.info(f"  Indexed {len(make_pairs)} make pairs, {len(skipped)} skipped")
-    return zip_bytes, filename, make_pairs
+            make_sets.append((make_name, full_path, app_path, xref_path))
+
+    logger.info(
+        f"  Indexed {len(make_sets)} makes "
+        f"({makes_with_xref} with xref, {makes_without_xref} without), "
+        f"{len(skipped)} skipped"
+    )
+    return zip_bytes, filename, make_sets
 
 
 def download_ewt_data_with_retry() -> tuple:
@@ -739,9 +773,9 @@ def download_ewt_data_with_retry() -> tuple:
             logger.info(f"EWT download attempt {attempt}/{Config.MAX_RETRY_ATTEMPTS}")
             sftp, transport = connect_motor_sftp()
             latest_zip = find_latest_ewt_zip(sftp)
-            zip_bytes, source_file, make_pairs = download_ewt_zip_to_buffer(sftp, latest_zip)
+            zip_bytes, source_file, make_sets = download_ewt_zip_to_buffer(sftp, latest_zip)
             logger.info(f"  EWT download successful on attempt {attempt}")
-            return zip_bytes, source_file, make_pairs
+            return zip_bytes, source_file, make_sets
 
         except Exception as e:
             last_error = e
@@ -862,6 +896,67 @@ def copy_ewt_application_make(cursor, make_name: str, content: str) -> int:
     csv_buffer.seek(0)
     cursor.copy_expert(
         f"COPY ewt_applications ({', '.join(columns)}) FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
+        csv_buffer
+    )
+
+    return rows_written
+
+
+def copy_ewt_xref_make(cursor, make_name: str, content: str) -> int:
+    """
+    COPY one make's Application_VCdbAttribute_xRef file directly into
+    ewt_applications_vcdb_attribute_xref via Postgres COPY.
+
+    This table is what differentiates multiple applications of the same operation
+    on the same base_vehicle_id — e.g. "Oil Pump R&R" on a 2021 Sierra 1500 has
+    separate applications for RWD vs 4WD, each flagged here with AttributeName='DriveType'
+    and AttributeID pointing to the relevant drive_type_id.
+
+    Per MOTOR's CDK, this table "lists only those VCdb attributes required to
+    differentiate between vehicle applications" — so an application may have 0, 1,
+    or many xref rows.
+
+    Expected pipe-delimited columns: ApplicationID, AttributeName, AttributeID
+    (Some files include a leading BOM which is stripped during normalization.)
+
+    Returns number of rows copied.
+    """
+    columns = ['application_id', 'attribute_name', 'attribute_id', 'make_name']
+
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_MINIMAL)
+
+    rows_written = 0
+    reader = csv.DictReader(io.StringIO(content), delimiter='|')
+
+    for row in reader:
+        normalized = {k.strip().lstrip('\ufeff'): (v.strip() if v else '') for k, v in row.items()}
+
+        app_id = normalized.get('ApplicationID', '').strip()
+        attr_name = normalized.get('AttributeName', '').strip()
+        attr_id = normalized.get('AttributeID', '').strip()
+
+        if not app_id or not attr_name or not attr_id:
+            continue
+
+        writer.writerow([
+            app_id,
+            attr_name,
+            attr_id,
+            make_name,
+        ])
+        rows_written += 1
+
+    # Some makes may ship an xref file with only a header row (no real attributes
+    # needed to differentiate). copy_expert with an empty body is a no-op, so
+    # short-circuit to avoid the round trip.
+    if rows_written == 0:
+        return 0
+
+    csv_buffer.seek(0)
+    cursor.copy_expert(
+        f"COPY ewt_applications_vcdb_attribute_xref ({', '.join(columns)}) "
+        f"FROM STDIN WITH (FORMAT CSV, NULL '\\N')",
         csv_buffer
     )
 
@@ -1010,10 +1105,16 @@ def sync_ewt_data():
     Requires SUPABASE_DB_URL env var (direct postgres connection, port 5432).
 
     Process:
-    1. Download zip + build make index
+    1. Download zip + build make file-set index (labor, apps, xref)
     2. Validate make file count
-    3. TRUNCATE both tables via direct SQL
-    4. For each make: read from zip → COPY labor → COPY apps → commit → gc
+    3. TRUNCATE all three EWT tables via direct SQL
+    4. For each make: read from zip → COPY labor → COPY apps → COPY xref → commit → gc
+
+    The xref table (ewt_applications_vcdb_attribute_xref) is what makes drivetrain-
+    specific, brake-config-specific, and submodel-specific labor filtering possible.
+    Not all makes ship an xref file; those that don't are loaded without one and
+    their labor will not be attribute-filterable (which is fine — if MOTOR didn't
+    ship differentiating attributes, the applications don't need differentiating).
     """
     supabase = get_supabase()
 
@@ -1043,42 +1144,45 @@ def sync_ewt_data():
         # STEP 1: DOWNLOAD ZIP + BUILD MAKE INDEX
         # =====================================================================
         logger.info("Step 1: Downloading EWT zip from MOTOR SFTP...")
-        zip_bytes, source_file, make_pairs = download_ewt_data_with_retry()
+        zip_bytes, source_file, make_sets = download_ewt_data_with_retry()
         results['source_file'] = source_file
-        logger.info(f"  Indexed {len(make_pairs)} make pairs from {source_file}")
+        logger.info(f"  Indexed {len(make_sets)} makes from {source_file}")
 
         # =====================================================================
         # STEP 2: VALIDATE
         # =====================================================================
-        if len(make_pairs) < Config.MIN_EWT_MAKE_FILES:
+        if len(make_sets) < Config.MIN_EWT_MAKE_FILES:
             raise ValueError(
-                f"EWT validation failed: Only {len(make_pairs)} make files, "
+                f"EWT validation failed: Only {len(make_sets)} make files, "
                 f"minimum {Config.MIN_EWT_MAKE_FILES}. Aborting."
             )
 
-        logger.info(f"  Validation passed: {len(make_pairs)} makes ready")
+        logger.info(f"  Validation passed: {len(make_sets)} makes ready")
 
         # =====================================================================
-        # STEP 3: TRUNCATE BOTH TABLES + STREAM COPY VIA DIRECT POSTGRES
+        # STEP 3: TRUNCATE ALL THREE TABLES + STREAM COPY VIA DIRECT POSTGRES
         # =====================================================================
         logger.info("Step 3: Connecting to Postgres for bulk COPY...")
         conn = get_db_conn()
         conn.autocommit = False
         cursor = conn.cursor()
 
-        logger.info("  Truncating ewt_labor and ewt_applications...")
+        logger.info("  Truncating ewt_labor, ewt_applications, and ewt_applications_vcdb_attribute_xref...")
         cursor.execute("TRUNCATE TABLE ewt_labor")
         cursor.execute("TRUNCATE TABLE ewt_applications")
+        cursor.execute("TRUNCATE TABLE ewt_applications_vcdb_attribute_xref")
         conn.commit()
         logger.info("  Tables truncated.")
 
         total_labor_rows = 0
         total_app_rows = 0
+        total_xref_rows = 0
         makes_processed = 0
         makes_failed = 0
+        makes_with_xref_loaded = 0
 
         with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
-            for make_name, labor_zip_path, app_zip_path in make_pairs:
+            for make_name, labor_zip_path, app_zip_path, xref_zip_path in make_sets:
                 try:
                     # LABOR
                     labor_content = zf.read(labor_zip_path).decode('utf-8-sig')
@@ -1092,16 +1196,27 @@ def sync_ewt_data():
                     del app_content
                     gc.collect()
 
+                    # XREF (optional — not every make ships one)
+                    xref_rows = 0
+                    if xref_zip_path:
+                        xref_content = zf.read(xref_zip_path).decode('utf-8-sig')
+                        xref_rows = copy_ewt_xref_make(cursor, make_name, xref_content)
+                        del xref_content
+                        gc.collect()
+                        if xref_rows > 0:
+                            makes_with_xref_loaded += 1
+
                     # Commit per make — partial progress is preserved if timeout occurs
                     conn.commit()
 
                     total_labor_rows += labor_rows
                     total_app_rows += app_rows
+                    total_xref_rows += xref_rows
                     makes_processed += 1
 
                     logger.info(
-                        f"  [{makes_processed}/{len(make_pairs)}] {make_name}: "
-                        f"{labor_rows:,} labor, {app_rows:,} apps"
+                        f"  [{makes_processed}/{len(make_sets)}] {make_name}: "
+                        f"{labor_rows:,} labor, {app_rows:,} apps, {xref_rows:,} xref"
                     )
 
                 except Exception as e:
@@ -1130,16 +1245,18 @@ def sync_ewt_data():
             'duration_seconds': (end_time - start_time).total_seconds(),
             'makes_processed': makes_processed,
             'makes_failed': makes_failed,
+            'makes_with_xref_loaded': makes_with_xref_loaded,
             'tables': {
                 'ewt_labor': {'rows': total_labor_rows},
-                'ewt_applications': {'rows': total_app_rows}
+                'ewt_applications': {'rows': total_app_rows},
+                'ewt_applications_vcdb_attribute_xref': {'rows': total_xref_rows}
             }
         })
 
         supabase.table('tire_data_sync_log').update({
             'status': 'completed',
             'source_file': source_file,
-            'records_inserted': total_labor_rows + total_app_rows,
+            'records_inserted': total_labor_rows + total_app_rows + total_xref_rows,
             'completed_at': end_time.isoformat()
         }).eq('id', log_id).execute()
 
@@ -1147,13 +1264,17 @@ def sync_ewt_data():
             "MOTOR EWT Sync Complete",
             f"""Source: {source_file}
 Duration: {duration_min:.1f} minutes
-Makes Processed: {makes_processed} / {len(make_pairs)} ({makes_failed} failed)
+Makes Processed: {makes_processed} / {len(make_sets)} ({makes_failed} failed)
+Makes With Xref Data: {makes_with_xref_loaded}
 Method: Direct Postgres COPY
 
-ewt_labor rows:        {total_labor_rows:,}
-ewt_applications rows: {total_app_rows:,}
+ewt_labor rows:                              {total_labor_rows:,}
+ewt_applications rows:                       {total_app_rows:,}
+ewt_applications_vcdb_attribute_xref rows:   {total_xref_rows:,}
 
-BrakeFinder and mechanical estimating data is now current.
+BrakeFinder and mechanical estimating data is now current, including the VCdb
+attribute cross-reference that lets labor lookups filter by drivetrain, brake
+config, submodel, and other differentiating attributes.
 """,
             is_error=False
         )
@@ -1195,14 +1316,15 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'service': 'tire-sync-service',
-        'version': '3.2',
+        'version': '3.4',
         'features': {
             'auto_retry': True,
             'max_attempts': Config.MAX_RETRY_ATTEMPTS,
             'sftp_connect_timeout': Config.SFTP_CONNECT_TIMEOUT,
             'sftp_channel_timeout': Config.SFTP_CHANNEL_TIMEOUT,
             'ewt_insert_method': 'direct_postgres_copy',
-            'syncs': ['motor_tiretech_smart', 'usventure_inventory', 'motor_ewt']
+            'ewt_loads_vcdb_attribute_xref': True,
+            'syncs': ['motor_tiretech_smart', 'usventure_inventory', 'motor_ewt', 'autocare_vcdb']
         },
         'timestamp': datetime.now(timezone.utc).isoformat()
     })

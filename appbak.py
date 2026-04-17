@@ -1,12 +1,13 @@
 """
-TIRE SYNC SERVICE - v3.2
+TIRE SYNC SERVICE - v3.3
 =========================
-Syncs tire data from MOTOR and USVenture to Supabase.
+Syncs tire data from MOTOR, USVenture, and AutoCare VCdb to Supabase.
 
 Endpoints:
 - POST /sync/motor     - Sync MOTOR TireTechSmart data (vehicle fitment)
 - POST /sync/usventure - Sync USVenture inventory (pricing & stock)
 - POST /sync/ewt       - Sync MOTOR GEN4.5 Mechanical EWT (labor times)
+- POST /sync/vcdb      - Sync AutoCare VCdb (vehicle configuration for BrakeFinder)
 - GET /health          - Health check
 - GET /status          - Recent sync history
 
@@ -14,11 +15,18 @@ Environment Variables Required:
 - MOTOR_FTP_HOST, MOTOR_FTP_USER, MOTOR_FTP_PASSWORD
 - USVENTURE_FTP_HOST, USVENTURE_FTP_USER, USVENTURE_FTP_PASSWORD
 - SUPABASE_URL, SUPABASE_SERVICE_KEY
-- SUPABASE_DB_URL  (direct postgres:// connection string for EWT COPY inserts)
+- SUPABASE_DB_URL  (direct postgres:// connection string for EWT/VCdb COPY inserts)
+- AUTOCARE_VIP_TOKEN (Bearer token for AutoCare VCdb API — future delta sync)
 - SENDGRID_API_KEY, ALERT_EMAIL
 - SYNC_API_KEY (optional)
 
 Changelog:
+- v3.3 (2026-03-21): Added AutoCare VCdb sync (/sync/vcdb) for BrakeFinder.
+                      Initial load from MySQL dump via multipart file upload.
+                      Parses positional INSERT statements using column order from
+                      CREATE TABLE blocks. Loads 14 vcdb_* tables via direct
+                      Postgres COPY. ~650K+ rows total. Future delta sync via
+                      AutoCare VCdb API (AUTOCARE_VIP_TOKEN) not yet implemented.
 - v3.2 (2026-03-18): EWT sync now uses direct Postgres COPY via psycopg2 instead of
                       HTTP batch inserts. Loads all 57 makes in minutes vs hours.
                       Requires SUPABASE_DB_URL env var (direct connection, port 5432).
@@ -1234,6 +1242,530 @@ def trigger_ewt_sync():
         results = sync_ewt_data()
         return jsonify(results), 200
     except Exception as e:
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
+
+
+# =============================================================================
+# DATA SYNC - AUTOCARE VCDB
+# =============================================================================
+#
+# Loads AutoCare VCdb into 14 vcdb_* tables in Supabase for BrakeFinder.
+#
+# Source column order (from CREATE TABLE in MySQL dump — INSERTs are positional):
+#   Year:                  YearID
+#   Make:                  MakeID, MakeName
+#   Model:                 ModelID, ModelName, VehicleTypeID
+#   SubModel:              SubModelID, SubModelName
+#   BaseVehicle:           BaseVehicleID, YearID, MakeID, ModelID
+#   Vehicle:               VehicleID, BaseVehicleID, SubmodelID, RegionID,
+#                          Source, PublicationStageID, PublicationStageSource,
+#                          PublicationStageDate
+#   DriveType:             DriveTypeID, DriveTypeName
+#   BrakeType:             BrakeTypeID, BrakeTypeName
+#   BrakeConfig:           BrakeConfigID, FrontBrakeTypeID, RearBrakeTypeID,
+#                          BrakeSystemID, BrakeABSID
+#   EngineBase:            EngineBaseID, Liter, CC, CID, Cylinders, BlockType,
+#                          EngBoreIn, EngBoreMetric, EngStrokeIn, EngStrokeMetric
+#   EngineConfig:          EngineConfigID, EngineDesignationID, EngineVINID,
+#                          ValvesID, EngineBaseID, FuelDeliveryConfigID,
+#                          AspirationID, CylinderHeadTypeID, FuelTypeID,
+#                          IgnitionSystemTypeID, EngineMfrID, EngineVersionID,
+#                          PowerOutputID
+#   VehicleToDriveType:    VehicleToDriveTypeID, VehicleID, DriveTypeID, Source
+#   VehicleToBrakeConfig:  VehicleToBrakeConfigID, VehicleID, BrakeConfigID, Source
+#   VehicleToEngineConfig: VehicleToEngineConfigID, VehicleID, EngineConfigID, Source
+#
+# Key join for BrakeFinder:
+#   Year+Make+Model → vcdb_base_vehicle → vcdb_vehicle (adds submodel)
+#   → vcdb_vehicle_to_drive_type → vcdb_drive_type (2WD/4WD/AWD)
+#   → vcdb_vehicle_to_brake_config → vcdb_brake_config (disc/drum front+rear)
+#   → vcdb_vehicle_to_engine_config → vcdb_engine_config → vcdb_engine_base (liters)
+#   vcdb_vehicle.vehicle_id also bridges to ewt_applications.base_vehicle_id via
+#   vcdb_vehicle.base_vehicle_id (the shared ACES BaseVehicleID key)
+# =============================================================================
+
+# (mysql_table, supabase_table, [columns_to_load], [source_col_order_from_create_table])
+# source_col_order = full column list from CREATE TABLE — needed because INSERTs are positional
+VCDB_TABLE_MAP = [
+    (
+        'Year', 'vcdb_year',
+        ['year_id'],
+        ['YearID']
+    ),
+    (
+        'Make', 'vcdb_make',
+        ['make_id', 'make_name'],
+        ['MakeID', 'MakeName']
+    ),
+    (
+        'Model', 'vcdb_model',
+        ['model_id', 'model_name', 'vehicle_type_id'],
+        ['ModelID', 'ModelName', 'VehicleTypeID']
+    ),
+    (
+        'SubModel', 'vcdb_submodel',
+        ['sub_model_id', 'sub_model_name'],
+        ['SubModelID', 'SubModelName']
+    ),
+    (
+        'BaseVehicle', 'vcdb_base_vehicle',
+        ['base_vehicle_id', 'year_id', 'make_id', 'model_id'],
+        ['BaseVehicleID', 'YearID', 'MakeID', 'ModelID']
+    ),
+    (
+        'Vehicle', 'vcdb_vehicle',
+        ['vehicle_id', 'base_vehicle_id', 'submodel_id', 'region_id', 'publication_stage_id'],
+        ['VehicleID', 'BaseVehicleID', 'SubmodelID', 'RegionID',
+         'Source', 'PublicationStageID', 'PublicationStageSource', 'PublicationStageDate']
+    ),
+    (
+        'DriveType', 'vcdb_drive_type',
+        ['drive_type_id', 'drive_type_name'],
+        ['DriveTypeID', 'DriveTypeName']
+    ),
+    (
+        'BrakeType', 'vcdb_brake_type',
+        ['brake_type_id', 'brake_type_name'],
+        ['BrakeTypeID', 'BrakeTypeName']
+    ),
+    (
+        'BrakeConfig', 'vcdb_brake_config',
+        ['brake_config_id', 'front_brake_type_id', 'rear_brake_type_id',
+         'brake_system_id', 'brake_abs_id'],
+        ['BrakeConfigID', 'FrontBrakeTypeID', 'RearBrakeTypeID', 'BrakeSystemID', 'BrakeABSID']
+    ),
+    (
+        'EngineBase', 'vcdb_engine_base',
+        ['engine_base_id', 'liter', 'cc', 'cid', 'cylinders', 'block_type'],
+        ['EngineBaseID', 'Liter', 'CC', 'CID', 'Cylinders', 'BlockType',
+         'EngBoreIn', 'EngBoreMetric', 'EngStrokeIn', 'EngStrokeMetric']
+    ),
+    (
+        'EngineConfig', 'vcdb_engine_config',
+        ['engine_config_id', 'engine_base_id', 'fuel_type_id'],
+        ['EngineConfigID', 'EngineDesignationID', 'EngineVINID', 'ValvesID',
+         'EngineBaseID', 'FuelDeliveryConfigID', 'AspirationID', 'CylinderHeadTypeID',
+         'FuelTypeID', 'IgnitionSystemTypeID', 'EngineMfrID', 'EngineVersionID', 'PowerOutputID']
+    ),
+    (
+        'VehicleToDriveType', 'vcdb_vehicle_to_drive_type',
+        ['vehicle_to_drive_type_id', 'vehicle_id', 'drive_type_id'],
+        ['VehicleToDriveTypeID', 'VehicleID', 'DriveTypeID', 'Source']
+    ),
+    (
+        'VehicleToBrakeConfig', 'vcdb_vehicle_to_brake_config',
+        ['vehicle_to_brake_config_id', 'vehicle_id', 'brake_config_id'],
+        ['VehicleToBrakeConfigID', 'VehicleID', 'BrakeConfigID', 'Source']
+    ),
+    (
+        'VehicleToEngineConfig', 'vcdb_vehicle_to_engine_config',
+        ['vehicle_to_engine_config_id', 'vehicle_id', 'engine_config_id'],
+        ['VehicleToEngineConfigID', 'VehicleID', 'EngineConfigID', 'Source']
+    ),
+]
+
+VCDB_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS vcdb_year (
+    year_id INTEGER PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_make (
+    make_id   INTEGER PRIMARY KEY,
+    make_name VARCHAR(50) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_model (
+    model_id        INTEGER PRIMARY KEY,
+    model_name      VARCHAR(100),
+    vehicle_type_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_submodel (
+    sub_model_id   INTEGER PRIMARY KEY,
+    sub_model_name VARCHAR(50) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_base_vehicle (
+    base_vehicle_id INTEGER PRIMARY KEY,
+    year_id         INTEGER NOT NULL,
+    make_id         INTEGER NOT NULL,
+    model_id        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcdb_bv_make_model ON vcdb_base_vehicle (make_id, model_id);
+CREATE INDEX IF NOT EXISTS idx_vcdb_bv_year       ON vcdb_base_vehicle (year_id);
+
+CREATE TABLE IF NOT EXISTS vcdb_vehicle (
+    vehicle_id           INTEGER PRIMARY KEY,
+    base_vehicle_id      INTEGER NOT NULL,
+    submodel_id          INTEGER NOT NULL,
+    region_id            INTEGER NOT NULL,
+    publication_stage_id INTEGER NOT NULL DEFAULT 4
+);
+CREATE INDEX IF NOT EXISTS idx_vcdb_v_base_vehicle ON vcdb_vehicle (base_vehicle_id);
+
+CREATE TABLE IF NOT EXISTS vcdb_drive_type (
+    drive_type_id   INTEGER PRIMARY KEY,
+    drive_type_name VARCHAR(30) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_brake_type (
+    brake_type_id   INTEGER PRIMARY KEY,
+    brake_type_name VARCHAR(30)
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_brake_config (
+    brake_config_id      INTEGER PRIMARY KEY,
+    front_brake_type_id  INTEGER NOT NULL,
+    rear_brake_type_id   INTEGER NOT NULL,
+    brake_system_id      INTEGER NOT NULL,
+    brake_abs_id         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_engine_base (
+    engine_base_id INTEGER PRIMARY KEY,
+    liter          VARCHAR(6),
+    cc             VARCHAR(8),
+    cid            VARCHAR(7),
+    cylinders      VARCHAR(2),
+    block_type     VARCHAR(2)
+);
+
+CREATE TABLE IF NOT EXISTS vcdb_engine_config (
+    engine_config_id INTEGER PRIMARY KEY,
+    engine_base_id   INTEGER,
+    fuel_type_id     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_vcdb_ec_base ON vcdb_engine_config (engine_base_id);
+
+CREATE TABLE IF NOT EXISTS vcdb_vehicle_to_drive_type (
+    vehicle_to_drive_type_id INTEGER PRIMARY KEY,
+    vehicle_id               INTEGER NOT NULL,
+    drive_type_id            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcdb_vdt_vehicle ON vcdb_vehicle_to_drive_type (vehicle_id);
+
+CREATE TABLE IF NOT EXISTS vcdb_vehicle_to_brake_config (
+    vehicle_to_brake_config_id INTEGER PRIMARY KEY,
+    vehicle_id                 INTEGER NOT NULL,
+    brake_config_id            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcdb_vbc_vehicle ON vcdb_vehicle_to_brake_config (vehicle_id);
+
+CREATE TABLE IF NOT EXISTS vcdb_vehicle_to_engine_config (
+    vehicle_to_engine_config_id INTEGER PRIMARY KEY,
+    vehicle_id                  INTEGER NOT NULL,
+    engine_config_id            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vcdb_vec_vehicle ON vcdb_vehicle_to_engine_config (vehicle_id);
+"""
+
+# Truncate order respects FK dependencies (children before parents)
+VCDB_TRUNCATE_ORDER = [
+    'vcdb_vehicle_to_engine_config',
+    'vcdb_vehicle_to_brake_config',
+    'vcdb_vehicle_to_drive_type',
+    'vcdb_vehicle',
+    'vcdb_base_vehicle',
+    'vcdb_engine_config',
+    'vcdb_engine_base',
+    'vcdb_brake_config',
+    'vcdb_brake_type',
+    'vcdb_drive_type',
+    'vcdb_submodel',
+    'vcdb_model',
+    'vcdb_make',
+    'vcdb_year',
+]
+
+
+def parse_vcdb_inserts(sql_content, mysql_table, source_col_order, dest_cols_snake):
+    """
+    Parse all INSERT rows for mysql_table from a positional MySQL dump.
+
+    mysql_table:       MySQL table name (e.g. 'Vehicle')
+    source_col_order:  Full column list from CREATE TABLE (positional mapping)
+    dest_cols_snake:   Snake_case column names we want to keep in Supabase
+
+    Returns: io.StringIO CSV buffer ready for COPY, and row count.
+    """
+    import re
+
+    # Manual overrides for VCdb column names with consecutive capital acronyms
+    # that the generic regex cannot split correctly.
+    SNAKE_OVERRIDES = {
+        'BrakeABSID':              'brake_abs_id',
+        'EngineVINID':             'engine_vin_id',
+        'BrakeABS':                'brake_abs',
+        'ABSID':                   'abs_id',
+        'ABCID':                   'abc_id',
+        'VINCode':                 'vin_code',
+        'CID':                     'cid',
+        'CC':                      'cc',
+    }
+
+    def to_snake(name):
+        if name in SNAKE_OVERRIDES:
+            return SNAKE_OVERRIDES[name]
+        s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+        return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+    source_snake = [to_snake(c) for c in source_col_order]
+    col_indices = []
+    for dest_col in dest_cols_snake:
+        if dest_col in source_snake:
+            col_indices.append(source_snake.index(dest_col))
+        else:
+            raise ValueError(
+                f"Column '{dest_col}' not found in {mysql_table} source columns: {source_snake}"
+            )
+
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer, quoting=csv.QUOTE_MINIMAL)
+    total_rows = 0
+
+    prefix = f'INSERT INTO `{mysql_table}` VALUES '
+
+    for line in sql_content.splitlines():
+        line = line.strip()
+        if not line.startswith(prefix):
+            continue
+
+        values_str = line[len(prefix):].rstrip(';\r\n')
+        i = 0
+        n = len(values_str)
+
+        while i < n:
+            if values_str[i] != '(':
+                i += 1
+                continue
+
+            i += 1  # skip (
+            raw_values = []
+            current = ''
+            in_string = False
+            escape_next = False
+
+            while i < n:
+                c = values_str[i]
+
+                if escape_next:
+                    current += c
+                    escape_next = False
+                    i += 1
+                    continue
+
+                if c == '\\':
+                    escape_next = True
+                    current += c
+                    i += 1
+                    continue
+
+                if c == "'" and not in_string:
+                    in_string = True
+                    i += 1
+                    continue
+
+                if c == "'" and in_string:
+                    if i + 1 < n and values_str[i + 1] == "'":
+                        current += "'"
+                        i += 2
+                        continue
+                    in_string = False
+                    i += 1
+                    continue
+
+                if in_string:
+                    current += c
+                    i += 1
+                    continue
+
+                if c == ',':
+                    raw_values.append(None if current.upper() == 'NULL' else current)
+                    current = ''
+                    i += 1
+                    continue
+
+                if c == ')':
+                    raw_values.append(None if current.upper() == 'NULL' else current)
+                    i += 1
+                    break
+
+                current += c
+                i += 1
+
+            if raw_values:
+                row = []
+                for idx in col_indices:
+                    val = raw_values[idx] if idx < len(raw_values) else None
+                    row.append('' if val is None else val)
+                writer.writerow(row)
+                total_rows += 1
+
+            while i < n and values_str[i] in (' ', ',', '\r', '\n'):
+                i += 1
+
+    csv_buffer.seek(0)
+    return csv_buffer, total_rows
+
+
+def sync_vcdb_data(sql_content):
+    """
+    Load AutoCare VCdb from a MySQL dump into 14 vcdb_* tables in Supabase.
+
+    Uses direct Postgres COPY for performance (same pattern as EWT sync).
+    Creates tables if they don't exist, then truncates and reloads all data.
+    Commits per table so partial progress is preserved if something fails.
+
+    sql_content: full text of the MySQL dump file (latin-1 decoded)
+    """
+    supabase = get_supabase()
+
+    if not Config.SUPABASE_DB_URL:
+        raise ValueError("SUPABASE_DB_URL environment variable is not set.")
+
+    start_time = datetime.now(timezone.utc)
+    log_id = None
+
+    try:
+        log_entry = supabase.table('tire_data_sync_log').insert({
+            'sync_type': 'autocare_vcdb',
+            'status': 'running',
+            'started_at': start_time.isoformat()
+        }).execute()
+        log_id = log_entry.data[0]['id']
+
+        logger.info("VCdb sync: connecting to Postgres...")
+        conn = get_db_conn()
+        conn.autocommit = False
+        cursor = conn.cursor()
+
+        # Step 1: Create tables if they don't exist
+        logger.info("VCdb sync: ensuring tables exist...")
+        for statement in VCDB_CREATE_SQL.strip().split('\n\n'):
+            statement = statement.strip()
+            if statement:
+                cursor.execute(statement)
+        conn.commit()
+        logger.info("  Tables ready.")
+
+        # Step 2: Truncate in dependency order
+        logger.info("VCdb sync: truncating existing data...")
+        for table in VCDB_TRUNCATE_ORDER:
+            cursor.execute(f"TRUNCATE TABLE {table}")
+        conn.commit()
+        logger.info("  Truncated.")
+
+        # Step 3: Load each table via COPY
+        total_rows = 0
+        table_results = {}
+
+        for mysql_table, supabase_table, dest_cols_snake, source_col_order in VCDB_TABLE_MAP:
+            try:
+                logger.info(f"  Loading {supabase_table}...")
+                csv_buffer, row_count = parse_vcdb_inserts(
+                    sql_content, mysql_table, source_col_order, dest_cols_snake
+                )
+                cols_sql = ', '.join(dest_cols_snake)
+                cursor.copy_expert(
+                    f"COPY {supabase_table} ({cols_sql}) FROM STDIN WITH (FORMAT CSV, NULL '')",
+                    csv_buffer
+                )
+                conn.commit()
+                total_rows += row_count
+                table_results[supabase_table] = row_count
+                logger.info(f"    {supabase_table}: {row_count:,} rows")
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"    FAILED {supabase_table}: {e}")
+                table_results[supabase_table] = f"ERROR: {e}"
+
+        cursor.close()
+        conn.close()
+
+        # Free memory
+        del sql_content
+        gc.collect()
+
+        end_time = datetime.now(timezone.utc)
+        duration_sec = (end_time - start_time).total_seconds()
+
+        supabase.table('tire_data_sync_log').update({
+            'status': 'completed',
+            'source_file': 'AutoCare VCdb MySQL dump',
+            'records_inserted': total_rows,
+            'completed_at': end_time.isoformat()
+        }).eq('id', log_id).execute()
+
+        send_alert(
+            "AutoCare VCdb Sync Complete",
+            f"Duration: {duration_sec:.1f}s | Total rows: {total_rows:,}\n\n" +
+            '\n'.join(f"  {t}: {r}" for t, r in table_results.items())
+        )
+
+        return {
+            'status': 'completed',
+            'duration_seconds': duration_sec,
+            'total_rows': total_rows,
+            'tables': table_results
+        }
+
+    except Exception as e:
+        logger.error(f"VCdb sync failed: {e}")
+        if log_id:
+            try:
+                supabase.table('tire_data_sync_log').update({
+                    'status': 'failed',
+                    'error_message': str(e),
+                    'completed_at': datetime.now(timezone.utc).isoformat()
+                }).eq('id', log_id).execute()
+            except Exception:
+                pass
+        send_alert("AutoCare VCdb Sync FAILED", f"Error: {str(e)}", is_error=True)
+        raise
+
+
+@app.route('/sync/vcdb', methods=['POST'])
+@require_api_key
+def trigger_vcdb_sync():
+    """
+    Trigger AutoCare VCdb sync from uploaded MySQL dump file.
+
+    Usage:
+        curl -X POST https://tire-sync.onrender.com/sync/vcdb \\
+             -H "X-API-Key: $SYNC_API_KEY" \\
+             -F "sql_file=@AutoCare_VCdb_NA_LDMDHDPS_enUS_MySQL_20260226.sql"
+
+    The .sql file can be uploaded directly (unzipped) or the zip can be
+    decompressed first. File is latin-1 encoded as produced by AutoCare VCdb.
+
+    Run monthly after downloading the new VCdb from autocarevip.com.
+    Once AutoCare API subscription is verified, this can be replaced with
+    daily delta syncs using the AUTOCARE_VIP_TOKEN env var.
+    """
+    logger.info("AutoCare VCdb sync triggered")
+
+    if 'sql_file' not in request.files:
+        return jsonify({
+            'status': 'error',
+            'error': 'No sql_file in request. Upload the AutoCare VCdb MySQL dump as multipart form field sql_file.'
+        }), 400
+
+    sql_file = request.files['sql_file']
+    if not sql_file.filename.endswith('.sql'):
+        return jsonify({
+            'status': 'error',
+            'error': f'Expected a .sql file, got: {sql_file.filename}'
+        }), 400
+
+    try:
+        logger.info(f"Reading SQL file: {sql_file.filename}")
+        sql_content = sql_file.read().decode('latin-1')
+        logger.info(f"SQL file size: {len(sql_content):,} bytes")
+
+        results = sync_vcdb_data(sql_content=sql_content)
+        return jsonify(results), 200
+    except Exception as e:
+        logger.error(f"VCdb sync failed: {e}")
         return jsonify({'status': 'failed', 'error': str(e)}), 500
 
 
