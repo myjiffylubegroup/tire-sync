@@ -29,6 +29,14 @@ Changelog:
                       application on the same base vehicle. Without it, DISTINCT ON collapsed
                       multiple drivetrain applications to one arbitrary row. Xref files were
                       previously explicitly skipped in download_ewt_zip_to_buffer; now loaded.
+
+                      Also raises the session statement_timeout to 30min at the start of
+                      the sync connection. The default Supabase statement_timeout (~2min)
+                      was tripping CHEVROLET_TRUCKS's ewt_applications COPY during v3.4's
+                      initial run — not caused by the xref addition itself but surfaced by
+                      it. 30min is generous headroom for any single statement while still
+                      failing eventually if something truly hangs. Scoped to this connection
+                      only, so other database users are unaffected.
 - v3.3 (2026-03-21): Added AutoCare VCdb sync (/sync/vcdb) for BrakeFinder.
                       Initial load from MySQL dump via multipart file upload.
                       Parses positional INSERT statements using column order from
@@ -1166,6 +1174,17 @@ def sync_ewt_data():
         conn = get_db_conn()
         conn.autocommit = False
         cursor = conn.cursor()
+
+        # Raise the session statement_timeout for this sync. The default Supabase
+        # timeout (~2 minutes) is too tight for a single large make's COPY — e.g.
+        # CHEVROLET_TRUCKS has 10M+ application rows and can exceed 2 minutes on
+        # the apps COPY alone. 30 minutes gives ample headroom for any single
+        # statement while still failing eventually if something truly hangs.
+        # This applies only to this connection, so other database users are
+        # unaffected.
+        cursor.execute("SET statement_timeout = '30min'")
+        conn.commit()
+        logger.info("  Session statement_timeout set to 30min for bulk COPY.")
 
         logger.info("  Truncating ewt_labor, ewt_applications, and ewt_applications_vcdb_attribute_xref...")
         cursor.execute("TRUNCATE TABLE ewt_labor")
