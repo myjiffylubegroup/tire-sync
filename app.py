@@ -70,6 +70,7 @@ from ftplib import FTP_TLS
 import socket
 import paramiko
 import psycopg2
+from psycopg2.extras import execute_values
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
 from sendgrid import SendGridAPIClient
@@ -110,6 +111,14 @@ class Config:
     # Direct Postgres connection for EWT bulk COPY inserts
     # Use direct connection (port 5432), NOT the pooler (port 6543)
     SUPABASE_DB_URL = os.environ.get('SUPABASE_DB_URL', '')
+
+    # Greets tenants to fan the vehicle catalog out to, comma-separated DIRECT
+    # Postgres URLs (port 5432, not the pooler). On every MOTOR smart sync, the
+    # deduped (year, make, model) US dimension is pushed into each tenant's
+    # greets_vehicle_catalog (Greets-core migration 0024) so a Greets-only tenant
+    # (no tt_smart_vehicles) can power its kiosk make/model dropdowns. Empty =
+    # fan-out disabled (this box just feeds its own tt_smart_vehicles).
+    GREETS_TENANT_DB_URLS = os.environ.get('GREETS_TENANT_DB_URLS', '')
 
     # SendGrid
     SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
@@ -548,6 +557,84 @@ def insert_smart_vehicles(supabase: Client, records: list) -> dict:
 
     logger.info(f"  Completed: {inserted:,} inserted, {errors:,} errors")
     return {'inserted': inserted, 'errors': errors, 'total': total_records}
+
+
+def fanout_greets_vehicle_catalog(prepared_records: list) -> dict:
+    """
+    Fan the vehicle DIMENSION out to each Greets tenant's greets_vehicle_catalog.
+
+    Greets-only tenants have no tt_smart_vehicles, but their kiosk make/model
+    dropdowns (vehicle-options) need the vehicle dimension. Rather than ship the
+    125K-row tire catalog everywhere, push just the deduped (year, make, model)
+    US rows (~19K) into each tenant's greets_vehicle_catalog (migration 0024),
+    on the same MOTOR cadence as this sync.
+
+    Reads from the records already in memory (no DB re-read). Each tenant is an
+    independent direct-Postgres connection; the reload runs in ONE transaction
+    (DELETE + INSERT), so readers see the old catalog until the swap commits.
+
+    NON-FATAL: a tenant failure is logged + alerted but never aborts the MOTOR
+    sync — the primary tt_smart_vehicles load has already succeeded by here.
+    """
+    target_urls = [u.strip() for u in Config.GREETS_TENANT_DB_URLS.split(',') if u.strip()]
+    if not target_urls:
+        logger.info("  Greets fan-out: no GREETS_TENANT_DB_URLS configured — skipping.")
+        return {'skipped': True, 'tenants': 0}
+
+    # Dedup the vehicle dimension (US only) straight from the in-memory records.
+    seen = set()
+    rows = []
+    for r in prepared_records:
+        if r.get('region_name') != 'United States':
+            continue
+        y, mk, md = r.get('year'), r.get('make_name'), r.get('model_name')
+        if not y or not mk or not md:
+            continue
+        key = (y, mk, md)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append((y, mk, md, 'United States'))
+
+    logger.info(f"  Greets fan-out: {len(rows):,} distinct (year, make, model) rows "
+                f"-> {len(target_urls)} tenant(s)")
+    if not rows:
+        logger.warning("  Greets fan-out: 0 rows to push — refusing to wipe tenants.")
+        return {'skipped': True, 'reason': 'no_rows', 'tenants': 0}
+
+    def redact(url: str) -> str:
+        return url.split('@', 1)[1] if '@' in url else '<url>'
+
+    loaded = 0
+    failed = 0
+    for url in target_urls:
+        conn = None
+        try:
+            conn = psycopg2.connect(url)
+            with conn:  # transaction: commit on success, rollback on exception
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM public.greets_vehicle_catalog")
+                    execute_values(
+                        cur,
+                        "INSERT INTO public.greets_vehicle_catalog "
+                        "(year, make_name, model_name, region_name) VALUES %s "
+                        "ON CONFLICT DO NOTHING",
+                        rows, page_size=5000,
+                    )
+            loaded += 1
+            logger.info(f"    reloaded {len(rows):,} rows -> {redact(url)}")
+        except Exception as e:  # noqa: BLE001 — report and continue to next tenant
+            failed += 1
+            logger.error(f"    Greets fan-out FAILED -> {redact(url)}: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
+
+    if failed:
+        send_alert("Greets vehicle-catalog fan-out had failures",
+                   f"{loaded} tenant(s) reloaded, {failed} failed. See logs.",
+                   is_error=True)
+    return {'rows': len(rows), 'tenants_loaded': loaded, 'tenants_failed': failed}
 
 
 # =============================================================================
@@ -1010,6 +1097,15 @@ def sync_motor_data():
         logger.info("Step 3: Truncating and inserting...")
         result = insert_smart_vehicles(supabase, prepared_records)
         results['tables']['tt_smart_vehicles'] = result
+
+        logger.info("Step 3.5: Fanning the vehicle catalog out to Greets tenants...")
+        try:
+            results['greets_vehicle_catalog'] = fanout_greets_vehicle_catalog(prepared_records)
+        except Exception as e:
+            # The function is already non-fatal internally; this is a last-resort
+            # guard so fan-out can never abort an otherwise-successful MOTOR sync.
+            logger.error(f"Greets fan-out unexpected error (non-fatal): {e}")
+            results['greets_vehicle_catalog'] = {'error': str(e)}
 
         end_time = datetime.now(timezone.utc)
         results.update({'status': 'completed', 'completed_at': end_time.isoformat(),
