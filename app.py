@@ -559,32 +559,11 @@ def insert_smart_vehicles(supabase: Client, records: list) -> dict:
     return {'inserted': inserted, 'errors': errors, 'total': total_records}
 
 
-def fanout_greets_vehicle_catalog(prepared_records: list) -> dict:
-    """
-    Fan the vehicle DIMENSION out to each Greets tenant's greets_vehicle_catalog.
-
-    Greets-only tenants have no tt_smart_vehicles, but their kiosk make/model
-    dropdowns (vehicle-options) need the vehicle dimension. Rather than ship the
-    125K-row tire catalog everywhere, push just the deduped (year, make, model)
-    US rows (~19K) into each tenant's greets_vehicle_catalog (migration 0024),
-    on the same MOTOR cadence as this sync.
-
-    Reads from the records already in memory (no DB re-read). Each tenant is an
-    independent direct-Postgres connection; the reload runs in ONE transaction
-    (DELETE + INSERT), so readers see the old catalog until the swap commits.
-
-    NON-FATAL: a tenant failure is logged + alerted but never aborts the MOTOR
-    sync — the primary tt_smart_vehicles load has already succeeded by here.
-    """
-    target_urls = [u.strip() for u in Config.GREETS_TENANT_DB_URLS.split(',') if u.strip()]
-    if not target_urls:
-        logger.info("  Greets fan-out: no GREETS_TENANT_DB_URLS configured — skipping.")
-        return {'skipped': True, 'tenants': 0}
-
-    # Dedup the vehicle dimension (US only) straight from the in-memory records.
+def _dedup_vehicle_dimension(records: list) -> list:
+    """Distinct (year, make_name, model_name), US only, as (y, mk, md, region) tuples."""
     seen = set()
     rows = []
-    for r in prepared_records:
+    for r in records:
         if r.get('region_name') != 'United States':
             continue
         y, mk, md = r.get('year'), r.get('make_name'), r.get('model_name')
@@ -595,12 +574,35 @@ def fanout_greets_vehicle_catalog(prepared_records: list) -> dict:
             continue
         seen.add(key)
         rows.append((y, mk, md, 'United States'))
+    return rows
 
-    logger.info(f"  Greets fan-out: {len(rows):,} distinct (year, make, model) rows "
-                f"-> {len(target_urls)} tenant(s)")
+
+def _reload_greets_tenants(rows: list) -> dict:
+    """Reload each configured Greets tenant's greets_vehicle_catalog with `rows`
+    (list of (year, make, model, region) tuples).
+
+    Greets-only tenants have no tt_smart_vehicles, but their kiosk make/model
+    dropdowns (vehicle-options) need this vehicle dimension — migration 0024
+    holds it. Each tenant is an independent direct-Postgres connection; the
+    reload runs in ONE transaction (DELETE + INSERT) so readers see the old
+    catalog until the swap commits.
+
+    NON-FATAL: a tenant failure is logged + alerted, never raised — so it can't
+    abort a MOTOR sync it's piggybacking on.
+
+    Config: GREETS_TENANT_DB_URLS (comma-separated direct Postgres URLs). Empty
+    disables the fan-out.
+    """
+    target_urls = [u.strip() for u in Config.GREETS_TENANT_DB_URLS.split(',') if u.strip()]
+    if not target_urls:
+        logger.info("  Greets fan-out: no GREETS_TENANT_DB_URLS configured — skipping.")
+        return {'skipped': True, 'tenants': 0}
     if not rows:
         logger.warning("  Greets fan-out: 0 rows to push — refusing to wipe tenants.")
         return {'skipped': True, 'reason': 'no_rows', 'tenants': 0}
+
+    logger.info(f"  Greets fan-out: {len(rows):,} distinct (year, make, model) rows "
+                f"-> {len(target_urls)} tenant(s)")
 
     def redact(url: str) -> str:
         return url.split('@', 1)[1] if '@' in url else '<url>'
@@ -635,6 +637,36 @@ def fanout_greets_vehicle_catalog(prepared_records: list) -> dict:
                    f"{loaded} tenant(s) reloaded, {failed} failed. See logs.",
                    is_error=True)
     return {'rows': len(rows), 'tenants_loaded': loaded, 'tenants_failed': failed}
+
+
+def fanout_greets_vehicle_catalog(prepared_records: list) -> dict:
+    """Fan the vehicle dimension out to each Greets tenant, sourced from the MOTOR
+    records already in memory (no DB re-read). Called at the end of the MOTOR
+    smart sync — same cadence, no separate feed."""
+    return _reload_greets_tenants(_dedup_vehicle_dimension(prepared_records))
+
+
+def fanout_greets_vehicle_catalog_from_db() -> dict:
+    """Same fan-out, but sourced by RE-READING tt_smart_vehicles from this box's
+    own Postgres (Config.SUPABASE_DB_URL, read-only). Lets you refresh / TEST the
+    Greets catalog on demand (the /sync/greets-catalog endpoint) WITHOUT a full
+    MOTOR download + reload."""
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT year, make_name, model_name "
+                "FROM tt_smart_vehicles "
+                "WHERE region_name = 'United States' "
+                "  AND year IS NOT NULL "
+                "  AND make_name  IS NOT NULL AND make_name  <> '' "
+                "  AND model_name IS NOT NULL AND model_name <> ''"
+            )
+            rows = [(y, mk, md, 'United States') for (y, mk, md) in cur.fetchall()]
+    finally:
+        conn.close()
+    logger.info(f"  Greets fan-out (from DB): read {len(rows):,} distinct rows from tt_smart_vehicles")
+    return _reload_greets_tenants(rows)
 
 
 # =============================================================================
@@ -1451,6 +1483,20 @@ def trigger_motor_sync():
     logger.info("MOTOR Smart sync triggered via webhook")
     try:
         results = sync_motor_data()
+        return jsonify(results), 200
+    except Exception as e:
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
+
+
+@app.route('/sync/greets-catalog', methods=['POST'])
+@require_api_key
+def trigger_greets_catalog_sync():
+    """Refresh the Greets vehicle catalog ONLY (read tt_smart_vehicles -> fan out
+    to GREETS_TENANT_DB_URLS). Fast + safe: no MOTOR download, read-only on the
+    source. Use this to test the fan-out or refresh a tenant on demand."""
+    logger.info("Greets vehicle-catalog fan-out triggered via webhook")
+    try:
+        results = fanout_greets_vehicle_catalog_from_db()
         return jsonify(results), 200
     except Exception as e:
         return jsonify({'status': 'failed', 'error': str(e)}), 500
