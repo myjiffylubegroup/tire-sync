@@ -162,6 +162,15 @@ class Config:
     SFTP_CHANNEL_TIMEOUT = 600
 
 
+class DataQualityError(Exception):
+    """A downloaded feed was structurally valid but its data failed the quality
+    gate (e.g. availability/pricing all zeroed). Means 'declined, not broken':
+    the webhook route maps it to HTTP 200 so the scheduler (Zapier) treats it as
+    a handled outcome and does NOT retry-storm. Genuine failures still raise
+    ordinary exceptions and return HTTP 500."""
+    pass
+
+
 def get_supabase() -> Client:
     """Create Supabase client."""
     return create_client(Config.SUPABASE_URL, Config.SUPABASE_SERVICE_KEY)
@@ -1229,7 +1238,7 @@ def sync_usventure_data():
             f"({stock_pct:.1%}), {with_retail:,} with retail ({retail_pct:.1%})"
         )
         if stock_pct < Config.MIN_USVENTURE_STOCK_PCT or retail_pct < Config.MIN_USVENTURE_RETAIL_PCT:
-            raise ValueError(
+            raise DataQualityError(
                 f"Data-quality gate failed — feed looks zeroed, aborting BEFORE "
                 f"truncate to preserve current inventory. "
                 f"stock: {with_stock:,}/{total_parts:,} ({stock_pct:.1%}, floor "
@@ -1547,6 +1556,11 @@ def trigger_usventure_sync():
     try:
         results = sync_usventure_data()
         return jsonify(results), 200
+    except DataQualityError as e:
+        # Declined a bad feed, not a broken pipeline — return 200 so the
+        # scheduler (Zapier) treats it as handled and does not retry-storm.
+        # The 🚨 alert email + sync_log row already record it for humans.
+        return jsonify({'status': 'rejected', 'reason': str(e)}), 200
     except Exception as e:
         return jsonify({'status': 'failed', 'error': str(e)}), 500
 
