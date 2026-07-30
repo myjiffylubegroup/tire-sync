@@ -140,6 +140,19 @@ class Config:
     MIN_USVENTURE_RECORDS = 5000
     MIN_EWT_MAKE_FILES = 50
 
+    # Data-quality gate for USVenture inventory.
+    # The record-count check above passes even when USAutoForce delivers a
+    # structurally-valid file with every part's availability AND pricing zeroed
+    # (happened 2026-07-30: 11,652 valid rows, but qty=0 and retail=0 on all of
+    # them — the count check passed, the table was truncated, and TireFinder was
+    # left quoting nothing). These floors catch that: if fewer than this share of
+    # parts carry warehouse stock, OR fewer carry a retail price, the sync aborts
+    # BEFORE truncating so the last good inventory stays live. Set low/generous on
+    # purpose — a legit file clears them easily; only a zeroed feed trips them.
+    # Actual percentages are logged every run (see sync_usventure_data) to tune.
+    MIN_USVENTURE_STOCK_PCT = 0.02   # >=2% of parts must have warehouse stock
+    MIN_USVENTURE_RETAIL_PCT = 0.25  # >=25% of parts must have a retail price
+
     # Retry settings
     MAX_RETRY_ATTEMPTS = 4
     RETRY_DELAY_SECONDS = 30
@@ -1199,6 +1212,31 @@ def sync_usventure_data():
 
         if len(prepared_records) < Config.MIN_USVENTURE_RECORDS:
             raise ValueError(f"Validation failed: {len(prepared_records):,} parts, minimum {Config.MIN_USVENTURE_RECORDS:,}")
+
+        # Data-quality gate — reject a structurally-valid but zeroed feed BEFORE
+        # the truncate, so a bad USAutoForce drop can't silently wipe live
+        # inventory (see Config.MIN_USVENTURE_STOCK_PCT / _RETAIL_PCT).
+        total_parts = len(prepared_records)
+        with_stock = sum(
+            1 for r in prepared_records
+            if (r.get('qty_fresno') or 0) + (r.get('qty_santa_clarita') or 0) > 0
+        )
+        with_retail = sum(1 for r in prepared_records if (r.get('retail_price') or 0) > 0)
+        stock_pct = with_stock / total_parts if total_parts else 0
+        retail_pct = with_retail / total_parts if total_parts else 0
+        logger.info(
+            f"  Data-quality: {with_stock:,}/{total_parts:,} parts with stock "
+            f"({stock_pct:.1%}), {with_retail:,} with retail ({retail_pct:.1%})"
+        )
+        if stock_pct < Config.MIN_USVENTURE_STOCK_PCT or retail_pct < Config.MIN_USVENTURE_RETAIL_PCT:
+            raise ValueError(
+                f"Data-quality gate failed — feed looks zeroed, aborting BEFORE "
+                f"truncate to preserve current inventory. "
+                f"stock: {with_stock:,}/{total_parts:,} ({stock_pct:.1%}, floor "
+                f"{Config.MIN_USVENTURE_STOCK_PCT:.0%}); "
+                f"retail: {with_retail:,}/{total_parts:,} ({retail_pct:.1%}, floor "
+                f"{Config.MIN_USVENTURE_RETAIL_PCT:.0%})."
+            )
 
         logger.info("Step 3: Truncating and inserting...")
         result = insert_usventure_inventory(supabase, prepared_records)
