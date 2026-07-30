@@ -768,27 +768,76 @@ def prepare_usventure_data(csv_content: str) -> list:
 
 
 def insert_usventure_inventory(supabase: Client, records: list) -> dict:
-    """Truncate table and insert prepared records."""
-    batch_size = 2000
-    inserted = 0
-    errors = 0
+    """Resilient reload — a bad/partial/failed load can never wipe live inventory.
+
+    Instead of truncating tire_inventory and hoping the refill succeeds, we:
+      1. Fully load the parsed rows into tire_inventory_staging.
+      2. Atomically swap staging into the live table in ONE transaction
+         (TRUNCATE + INSERT..SELECT): MVCC shows readers the old rows until COMMIT,
+         then the new ones — no empty window — and any error rolls the whole thing
+         back, leaving live inventory untouched.
+      3. Snapshot the validated result into tire_inventory_last_good for instant
+         manual rollback.
+
+    Runs over the direct Postgres connection (not the REST API) so it never depends
+    on PostgREST's schema cache for the internal staging/last_good tables. The
+    `supabase` arg is unused but kept for call-site signature stability.
+    """
+    from psycopg2.extras import execute_values
+
     total_records = len(records)
 
-    logger.info("  Truncating tire_inventory...")
-    supabase.table('tire_inventory').delete().neq('created_at', '1900-01-01').execute()
+    # Column order = the keys prepare_usventure_data() produces. id / created_at /
+    # updated_at / quantity_available / warehouse_code are left to their defaults.
+    cols = [
+        'part_number', 'brand_code', 'sales_class', 'upc', 'discontinued', 'is_idle',
+        'tire_type', 'name', 'description', 'width', 'aspect_ratio', 'rim_diameter',
+        'tire_size', 'speed_rating', 'load_rating', 'load_range', 'ply_rating', 'utqg',
+        'load_capacity', 'weight', 'tread_depth', 'sidewall', 'ev_compatible',
+        'run_flat', 'snowflake', 'noise_canceling', 'warranty', 'fet', 'cost',
+        'retail_price', 'map_price', 'account_number', 'qty_fresno',
+        'qty_santa_clarita', 'last_synced_at',
+    ]
+    col_list = ', '.join(cols)
+    rows = [tuple(r.get(c) for c in cols) for r in records]
 
-    for i in range(0, total_records, batch_size):
-        batch = records[i:i + batch_size]
-        try:
-            supabase.table('tire_inventory').insert(batch).execute()
-            inserted += len(batch)
-            logger.info(f"  Inserted batch: {inserted:,} / {total_records:,} records")
-        except Exception as e:
-            logger.error(f"  Error inserting batch: {e}")
-            errors += len(batch)
+    conn = get_db_conn()
+    try:
+        # 1. Load staging (never touches live). Fully replaced each run.
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE tire_inventory_staging")
+                execute_values(
+                    cur,
+                    f"INSERT INTO tire_inventory_staging ({col_list}) VALUES %s",
+                    rows, page_size=1000,
+                )
+                cur.execute("SELECT count(*) FROM tire_inventory_staging")
+                staged = cur.fetchone()[0]
+        if staged != total_records:
+            # Never swap an incomplete load.
+            raise ValueError(
+                f"Staging load incomplete: {staged:,}/{total_records:,} rows — "
+                f"aborting before swap; live inventory left untouched")
+        logger.info(f"  Staged {staged:,} parts into tire_inventory_staging")
 
-    logger.info(f"  Completed: {inserted:,} inserted, {errors:,} errors")
-    return {'unique_parts': total_records, 'inserted': inserted, 'errors': errors}
+        # 2. Atomic swap. Rolls back on any error -> live inventory preserved.
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE tire_inventory")
+                cur.execute("INSERT INTO tire_inventory SELECT * FROM tire_inventory_staging")
+        logger.info("  Swapped staging -> tire_inventory (atomic)")
+
+        # 3. Snapshot the validated result for instant manual rollback.
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE tire_inventory_last_good")
+                cur.execute("INSERT INTO tire_inventory_last_good SELECT * FROM tire_inventory")
+        logger.info("  Refreshed tire_inventory_last_good snapshot")
+
+        return {'unique_parts': total_records, 'inserted': staged, 'errors': 0}
+    finally:
+        conn.close()
 
 
 # =============================================================================
@@ -1233,9 +1282,12 @@ def sync_usventure_data():
         with_retail = sum(1 for r in prepared_records if (r.get('retail_price') or 0) > 0)
         stock_pct = with_stock / total_parts if total_parts else 0
         retail_pct = with_retail / total_parts if total_parts else 0
+        _costs = [float(r['cost']) for r in prepared_records if (r.get('cost') or 0) > 0]
+        avg_cost = round(sum(_costs) / len(_costs), 2) if _costs else 0
         logger.info(
             f"  Data-quality: {with_stock:,}/{total_parts:,} parts with stock "
-            f"({stock_pct:.1%}), {with_retail:,} with retail ({retail_pct:.1%})"
+            f"({stock_pct:.1%}), {with_retail:,} with retail ({retail_pct:.1%}), "
+            f"avg cost ${avg_cost}"
         )
         if stock_pct < Config.MIN_USVENTURE_STOCK_PCT or retail_pct < Config.MIN_USVENTURE_RETAIL_PCT:
             raise DataQualityError(
@@ -1257,7 +1309,9 @@ def sync_usventure_data():
 
         supabase.table('tire_data_sync_log').update({
             'status': 'completed', 'records_processed': len(prepared_records),
-            'records_inserted': result['inserted'], 'completed_at': end_time.isoformat()
+            'records_inserted': result['inserted'], 'completed_at': end_time.isoformat(),
+            'parts_with_stock': with_stock, 'parts_with_retail': with_retail,
+            'avg_cost': avg_cost,
         }).eq('id', log_id).execute()
 
         send_alert("USVenture Inventory Sync Complete",
