@@ -142,16 +142,21 @@ class Config:
 
     # Data-quality gate for USVenture inventory.
     # The record-count check above passes even when USAutoForce delivers a
-    # structurally-valid file with every part's availability AND pricing zeroed
-    # (happened 2026-07-30: 11,652 valid rows, but qty=0 and retail=0 on all of
-    # them — the count check passed, the table was truncated, and TireFinder was
-    # left quoting nothing). These floors catch that: if fewer than this share of
-    # parts carry warehouse stock, OR fewer carry a retail price, the sync aborts
-    # BEFORE truncating so the last good inventory stays live. Set low/generous on
-    # purpose — a legit file clears them easily; only a zeroed feed trips them.
-    # Actual percentages are logged every run (see sync_usventure_data) to tune.
+    # structurally-valid file with every part's availability zeroed (happened
+    # 2026-07-30: 11,652 valid rows, but qty=0 on all of them — the count check
+    # passed, the table was truncated, and TireFinder was left quoting nothing).
+    # This floor catches that: if fewer than this share of parts carry warehouse
+    # stock, the sync aborts BEFORE truncating so the last good inventory stays
+    # live. Set low/generous on purpose — a legit file clears it easily; only a
+    # zeroed feed trips it. Actual percentages are logged every run (see
+    # sync_usventure_data) to tune.
+    #
+    # NOTE: warehouse stock is the ONLY blocking signal. Retail price is logged
+    # for visibility but deliberately NOT gated: TireFinder prices from `cost`
+    # (+ markup), never from the retail_price column, so a feed that zeroes only
+    # retail is still fully usable. Gating on it once (@0.25) wrongly blocked a
+    # good, stock-corrected file on 2026-07-30. Do not add retail back to the gate.
     MIN_USVENTURE_STOCK_PCT = 0.02   # >=2% of parts must have warehouse stock
-    MIN_USVENTURE_RETAIL_PCT = 0.25  # >=25% of parts must have a retail price
 
     # Retry settings
     MAX_RETRY_ATTEMPTS = 4
@@ -1273,7 +1278,8 @@ def sync_usventure_data():
 
         # Data-quality gate — reject a structurally-valid but zeroed feed BEFORE
         # the truncate, so a bad USAutoForce drop can't silently wipe live
-        # inventory (see Config.MIN_USVENTURE_STOCK_PCT / _RETAIL_PCT).
+        # inventory. Gated on warehouse stock only; retail is logged, not gated
+        # (see Config.MIN_USVENTURE_STOCK_PCT and the note beside it).
         total_parts = len(prepared_records)
         with_stock = sum(
             1 for r in prepared_records
@@ -1289,14 +1295,13 @@ def sync_usventure_data():
             f"({stock_pct:.1%}), {with_retail:,} with retail ({retail_pct:.1%}), "
             f"avg cost ${avg_cost}"
         )
-        if stock_pct < Config.MIN_USVENTURE_STOCK_PCT or retail_pct < Config.MIN_USVENTURE_RETAIL_PCT:
+        if stock_pct < Config.MIN_USVENTURE_STOCK_PCT:
             raise DataQualityError(
                 f"Data-quality gate failed — feed looks zeroed, aborting BEFORE "
                 f"truncate to preserve current inventory. "
                 f"stock: {with_stock:,}/{total_parts:,} ({stock_pct:.1%}, floor "
-                f"{Config.MIN_USVENTURE_STOCK_PCT:.0%}); "
-                f"retail: {with_retail:,}/{total_parts:,} ({retail_pct:.1%}, floor "
-                f"{Config.MIN_USVENTURE_RETAIL_PCT:.0%})."
+                f"{Config.MIN_USVENTURE_STOCK_PCT:.0%}). "
+                f"(retail {with_retail:,}/{total_parts:,} ({retail_pct:.1%}) — logged, not gated.)"
             )
 
         logger.info("Step 3: Truncating and inserting...")
