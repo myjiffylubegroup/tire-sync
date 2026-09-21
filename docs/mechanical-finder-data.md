@@ -24,6 +24,10 @@ how the 2025 Jetta showed up in September 2026.
 - **How to load:** `POST https://tire-sync.onrender.com/sync/ewt` with header
   `X-API-Key: $SYNC_API_KEY`. The service picks the newest dated zip on the
   SFTP, so you don't need to download anything.
+- **Progress:** `curl` prints nothing until the load finishes. Makes load in
+  alphabetical order, so `select make_name, count(*) from ewt_labor group by 1`
+  shows how far along it is. `GET /status` (no key needed) shows the run's
+  status.
 - **Downtime:** the sync TRUNCATES all three EWT tables, commits, and then
   COPYs one make at a time. The load takes about 20 minutes, and **MechanicalFinder
   returns no labor for that whole time.** If the load fails partway, the tables
@@ -38,11 +42,12 @@ Load history (`tire_data_sync_log`, `sync_type = 'motor_ewt'`):
 |---|---|---|
 | 2026-03-18 | `Mechanical_EWT_ACES_20260113.zip` | ~72.9M |
 | 2026-04-17 | `Mechanical_EWT_ACES_20260330.zip` | ~72.9M |
+| 2026-09-21 | `Mechanical_EWT_ACES_20260804.zip` | ~73.8M (19.5 min) |
 
-Coverage from the 20260330 file: model-year 2025 is only partly covered, and
-2026 is essentially absent. As of 2026-09-21 the SFTP has
-`Mechanical_EWT_ACES_20260804.zip` (posted 2026-08-04), which hasn't been
-loaded yet.
+The 20260804 file raised model-year 2025 coverage from 278 to 340 VCdb base
+vehicles and 2026 coverage from 1 to 58. That added the 2025 and 2026 VW Jetta,
+which were missing before. MOTOR's coverage of the newest model years grows
+with each release, so check for a new file every quarter.
 
 ## AutoCare VCdb (vehicle picker)
 
@@ -69,7 +74,7 @@ Keep a copy of every file we load in the Drive folder
 [Jiffy Lube Ops - Data Automation Project](https://drive.google.com/drive/folders/1JrwVF3fr8PGItV2TMppYFAY_F5FV18dj).
 The folder also holds the EWT format spec
 (`MOTOR-GEN4.5-MechanicalEWT-CDK(v2 0).pdf`). The 20260113 EWT file is
-archived there. The 20260330 EWT file and the 20260226 VCdb dump were never
+and 20260804 EWT files are archived there. The 20260330 EWT file and the 20260226 VCdb dump were never
 archived.
 
 MOTOR drops a marker file next to each EWT zip (e.g.
