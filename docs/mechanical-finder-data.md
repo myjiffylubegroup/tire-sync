@@ -102,8 +102,9 @@ unless you grant it access in Privacy & Security → Files & Folders.
    base_vehicle_id = 177696;` should be above 0.
 6. Add the new load to the history tables in this doc, and copy the files you
    loaded into the Drive archive.
-7. Check whether the new file filled any of the gaps in `ewt_labor_supplement`
-   (see the next section). If it did, deactivate those supplement rows.
+7. Rerun the gap audit ([Find gaps](#find-gaps)) and check whether the new
+   file filled any of the gaps in `ewt_labor_supplement`. If it did,
+   deactivate those supplement rows.
 
 ## Supplemental labor
 
@@ -111,8 +112,11 @@ Some generations are thin in MOTOR's own file, not in our load, so
 reloading won't fix them. Example: 2011–2018 Ram 2500/3500 have only five
 BRAKES operations (front axle brakes R&R, and no rear axle, rotor or caliper).
 2010 and 2019+ are complete. Supplemented so far: that Ram, 2013–2020 Lincoln
-MKZ, 2012–2015 Honda Crosstour, 2015–2016 Mercedes C300 and 2014–2015 Audi
-RS7 (brakes only).
+MKZ, 2012–2015 Honda Crosstour, 2015–2016 Mercedes C300, 2014–2015 Audi
+RS7 and 2018–2023 Chevrolet Traverse (brakes), plus front ball joints and
+fluid changes on several platform twins and the gap audit's second batch
+(see [What's seeded](#whats-seeded)).
+To find more, run the [gap audit](#find-gaps).
 
 `ewt_labor_supplement` (migration `ewt_labor_supplement`, applied 2026-10-27;
 source in `supabase/sql/ewt_labor_supplement.sql`) holds shop-estimated
@@ -142,6 +146,13 @@ operations for those gaps.
 - **Hours need sign-off.** Fill `source_note` (where the figure came from)
   and `approved_by` on every row. Prefer MOTOR's figure for the neighbouring
   generation, in MOTOR's own wording.
+- **The description names the car it's attached to, never the source.** It
+  shows on the customer's quote, so a Traverse row reads "REAR AXLE;
+  Traverse", not MOTOR's "REAR AXLE; Enclave". Swap the model name and keep
+  the rest of MOTOR's wording; the source goes in `source_note`. Copied fluid
+  rows also carry the source's drive type ("Telluride; AWD") so a FWD car
+  doesn't get offered it. Every earlier row was relabelled on 2026-10-27
+  (`supabase/sql/ewt_labor_supplement_relabel.sql`).
 
 ### What's seeded
 
@@ -152,7 +163,7 @@ MOTOR's 2010 Dodge Ram and approved by Sean on 2026-10-27:
 
 | Description | Hours | Add-on |
 |---|---|---|
-| REAR AXLE; Ram 2500, 3500 (brakes R&R) | 0.9 | no |
+| REAR AXLE; Ram 2500 (or Ram 3500) (brakes R&R) | 0.9 | no |
 | To R&I Or R&R Rotor, Add; Front; Each | 0.2 | yes |
 | To R&I Or R&R Rotor, Add; Rear; w/o Dual Rear Wheels; Each | 0.2 | yes |
 | To R&I Or R&R Rotor, Add; Rear; w/Dual Rear Wheels; Each (3500 only) | 0.6 | yes |
@@ -167,13 +178,14 @@ calipers job would come to 3.3 hr instead of 1.7.
 **Lincoln MKZ 2013–2020** (base vehicles 124247, 127778, 130057, 134765,
 140517, 145332, 147391, 150500). MOTOR applies only a brake vacuum sensor to
 these. Its CD4 Ford Fusion rows are labelled "Fusion, MKZ" and are identical
-for 2013–2020, so they're copied verbatim (seeded 2026-10-27):
+for 2013–2020, so they're copied verbatim, with the label naming the MKZ
+(seeded 2026-10-27):
 
 | Description | Hours | Add-on |
 |---|---|---|
-| BOTH AXLES; Fusion, MKZ | 1.6 | no |
-| FRONT AXLE; Fusion, MKZ | 0.9 | no |
-| REAR AXLE; Fusion, MKZ | 0.9 | no |
+| BOTH AXLES; MKZ | 1.6 | no |
+| FRONT AXLE; MKZ | 0.9 | no |
+| REAR AXLE; MKZ | 0.9 | no |
 | To R&I Or R&R Rotor, Add; Front; Both Sides / One Side | 0.4 / 0.2 | yes |
 | To R&I Or R&R Rotor, Add; Rear; Both Sides / One Side | 0.4 / 0.2 | yes |
 | To R&R Caliper, Add; Each | 0.2 | yes |
@@ -184,8 +196,8 @@ Crosstour (same generation; VCdb renamed the model for 2012):
 
 | Description | Hours | Add-on |
 |---|---|---|
-| FRONT AXLE; Accord Crosstour | 0.9 | no |
-| REAR AXLE; Accord Crosstour | 0.9 | no |
+| FRONT AXLE; Crosstour | 0.9 | no |
+| REAR AXLE; Crosstour | 0.9 | no |
 | To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
 | To R&R Caliper, Add; Each | 0.2 | yes |
 
@@ -200,8 +212,8 @@ applies only four ABS speed sensor ops. Copied from MOTOR's 2017–2019 C300
 
 | Description | Hours | Add-on |
 |---|---|---|
-| FRONT AXLE; C Class | 0.9 | no |
-| REAR AXLE; C Class | 0.9 | no |
+| FRONT AXLE; C300 | 0.9 | no |
+| REAR AXLE; C300 | 0.9 | no |
 | To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
 | To R&R Caliper, Add; Each | 0.2 | yes |
 
@@ -215,14 +227,144 @@ the vacuum pump. Copied from MOTOR's 2016–2018 RS7. Source:
 
 | Description | Hours | Add-on |
 |---|---|---|
-| FRONT AXLE; All Models | 0.9 | no |
-| REAR AXLE; All Models | 0.9 | no |
+| FRONT AXLE; RS7 | 0.9 | no |
+| REAR AXLE; RS7 | 0.9 | no |
 | To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
 | To R&R Caliper, Add; Each | 0.2 | yes |
 
 MOTOR's C7 sources disagree on the rotor add-on: the 2016–18 RS7 says +0.2
 each, and the 2014–15 S7 and A7 say +0.3. Sean picked +0.2, the RS7's own
 figure, on 2026-10-27.
+
+**Chevrolet Traverse 2018–2023** (base vehicles 143481, 146475, 148805,
+152895, 156732, 161161). MOTOR has the standalone rotor and caliper jobs but
+no axle brake job, so pads couldn't be quoted. Copied from MOTOR's Buick
+Enclave of the same years (same C1XX platform; MOTOR's standalone
+rotor/caliper hours are identical on both, and its 2017 rows were labelled
+"Enclave, Traverse"). Found by the gap audit; about 23 PCJL visits a month.
+Source: `supabase/sql/ewt_labor_supplement_traverse.sql`.
+
+| Description | Hours | Add-on |
+|---|---|---|
+| FRONT AXLE; Traverse | 1.1 | no |
+| REAR AXLE; Traverse | 1.1 | no |
+| To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
+| To R&R Calipers, Add; Each | 0.2 | yes |
+
+**Platform twins** (`supabase/sql/ewt_labor_supplement_twins.sql`). In these
+cases MOTOR gives one twin an operation and leaves it off the other, even
+though the twins' other hours match. The rows are copied from the twin's
+MOTOR rows for the same year at insert time, word for word (except a fluid
+row's label, which names the target and its drive type), with MOTOR's
+footnote after the `Shop estimate — not MOTOR` prefix. The script skips a
+target that already has the operation, so it's safe to rerun.
+
+| Target | Years | Copied from | What |
+|---|---|---|---|
+| Jeep Grand Cherokee | 2016–2021 | Dodge Durango | Ball joint add-ons on the lower control arm (0.3 one / 0.2 each additional). 2011–15 already had them. |
+| Ford Escape | 2021–2025 | Ford Bronco Sport | Same, lower arm |
+| Chevrolet Tahoe | 2021–2025 | GMC Yukon | Same, lower and upper arm |
+| Chevrolet Suburban | 2021–2025 | GMC Yukon XL | Same, lower and upper arm |
+| Chevrolet Equinox | 2025 | GMC Terrain | Same, lower arm |
+| Hyundai Sonata | 2025 | Kia K5 | Same, lower arm, plus rear differential fluid 0.5 |
+| Kia Telluride | 2020–2025 | Hyundai Palisade | Transfer case fluid 0.5 |
+| Ford Edge | 2016–2018 | Lincoln MKX | Rear differential fluid 0.7 |
+
+**Gap audit batch 2** (`supabase/sql/ewt_labor_supplement_gap_batch2.sql`,
+56 rows). These were the audit's open questions; Sean approved each one on
+2026-10-27.
+
+| Target | Years | Source | What | PCJL visits/mo |
+|---|---|---|---|---|
+| Toyota 4Runner | 2010–2023 | Lexus GX460, same year (J150) | Transfer case fluid 0.6, "4Runner; 4WD" | ~41 |
+| Ford Escape | 2013–2019 | The Escape's own MOTOR front rotor add-on, mirrored to the rear | Rear rotor add-on 0.3 one side / 0.6 both | ~30 |
+| Toyota Camry | 2012–2014 | 2015 Camry (same XV50 generation) | Inner tie rod 1.0 both / 0.7 one | ~28 |
+| Toyota Highlander | 2008–2013 | Lexus RX350, same year | Transfer case fluid 0.6, "Highlander; AWD" | ~17 |
+| Honda Pilot | 2009–2015 | Honda Ridgeline knuckle add-on (2015 uses 2014) | Lower ball joint add-on 0.4 one / 0.6 both | ~15 |
+| Ford Escape | 2020 | 2021 Ford Bronco Sport (no 2020 exists) | Ball joint add-on 0.3 / 0.2 | ~6 |
+
+Two of these aren't verbatim same-year copies, which is why they went to Sean:
+
+- **Escape rear rotor.** No twin has it, MKC included.
+- **Camry inner tie rod.** MOTOR's own 2012–14 outer tie rod is 1.4 hr,
+  against 0.7 for 2015–17.
+
+Deliberately not filled:
+
+- **RAV4 2006–12 inner tie rod.** The neighbouring years only price it as an
+  add-on to an 8.5 hr rack R&I.
+- **Highlander 2008–13 rear sway link.** The RX and Highlander sway bar hours
+  differ.
+
+MOTOR has no transfer case fluid op for the 2014–21 Tundra in any nearby year
+or twin, so the audit can't flag it.
+
+### Find gaps
+
+`supabase/sql/ewt_labor_gap_audit.sql` (migrations `ewt_gap_audit_1…4`,
+applied 2026-10-27) is a saved audit of MOTOR's holes, ranked by how often
+PCJL sees the car. **Rerun it after every EWT load** and after adding
+supplement rows:
+
+```sql
+set statement_timeout = '15min';
+select public.ewt_gap_audit_refresh();   -- about a minute; returns "N base vehicles audited, M gaps"
+select * from public.ewt_gap_audit;       -- busiest first
+```
+
+Run it from the SQL editor or the Supabase MCP, not through PostgREST,
+because it takes longer than the API's 8-second limit.
+`ewt_gap_audit_refresh(p_months, p_min_visits_12m)` defaults to the last 12
+months and 36 visits a year (3 a month).
+
+How it works:
+
+- **Traffic.** Last 12 months of non-void PCJL invoices, counted by VIN, not
+  `invoices.vehicle_id` (that is 0 on about a third of rows). DDS's
+  year/make/model text ("FORD TRUCKS" / "F250 HD PICKUP") is mapped to a VCdb
+  `base_vehicle_id`. About 99.5% of visits map. The result is stored in
+  `ewt_gap_traffic`.
+- **Core jobs, not raw operations.** `ewt_gap_job_codes()` maps each MOTOR (and
+  supplement) row to the ~35 jobs a CSA actually quotes in BRAKES, STEERING,
+  FRONT/REAR SUSPENSION, COOLING SYSTEM and MAINTENANCE & LUBRICATION:
+  front brake job, rear rotors, inner tie rod, front ball joint, water pump,
+  transfer case fluid, and so on. A job counts whether MOTOR prices it
+  standalone or as an add-on (e.g. "To R&R Inner Tie Rods, Add" on rack R&I,
+  or "To R&R Ball Joint, Add" on the control arm). A raw operation-by-operation
+  diff was tried first, and it was mostly noise from real generation changes.
+- **Evidence.** A missing job is flagged when either the same VCdb model has
+  it within 6 years on **both** sides, or a same-year platform twin has it.
+  Twins are listed by hand in `ewt_gap_platform_twins` (Sierra/Silverado,
+  Yukon/Tahoe, Durango/Grand Cherokee, MKZ/Fusion, Palisade/Telluride …),
+  because MOTOR's operation ids are per make and can't reveal cross-make
+  twins. Add a row there when you find a new pair. Keep the year range to
+  the years the two really share a platform: Tundra/Sequoia, CR-V/RDX and
+  Accord/Crosstour after 2012 were taken out because they differ.
+- **Equipment.** Rear rotor/caliper gaps need VCdb rear disc brakes.
+  Differential and transfer case gaps need a VCdb RWD/4WD/AWD drive type. A
+  base vehicle with no MOTOR rows at all is a coverage problem (newest model
+  year, see the Jetta), not a hole, so it's left out.
+- **Supplement rows count as coverage**, so a filled gap drops off on the
+  next refresh. (Side effect: a supplemented year can serve as "adjacent year"
+  evidence for its neighbour, e.g. 2020 Escape after 2021 was filled.)
+
+Each row is a lead, not a verdict. Before filling one, look at what MOTOR has
+for the car in that section. Most leftovers are one of three things:
+
+- **Equipment the car doesn't have.** VCdb doesn't record it, e.g. a 2016+
+  Tacoma or a 2014–18 Corolla has no rear sway bar links.
+- **Hours that disagree within the generation.** MOTOR's 2012–14 Camry outer
+  tie rod is 1.4 hr, but 2015–17 is 0.7.
+- **No same-platform source.** For example, Escape 2013–19 rear rotors (Sean
+  chose a mirror of the front add-on).
+
+Those go to Sean. Fill without asking only when the hours come verbatim from
+MOTOR for the same platform: same generation of the same model, or a twin
+in the same year whose other hours in that section match.
+
+Work tables (`ewt_gap_traffic`, `ewt_gap_jobs`, `ewt_gap_sisters`,
+`ewt_gap_refresh_log`) are rebuilt on every refresh. They have RLS on and
+no API grants, like `ewt_labor`.
 
 ### Add a gap
 
@@ -249,6 +391,8 @@ figure, on 2026-10-27.
    ```
    Leave `motor_db_footnote` at its default, or append to it (for example
    `'Shop estimate — not MOTOR. Does not Include: Bleed Master Cylinder.'`).
+   Name the car the row is attached to in `motor_db_description`, not the
+   source car (see the rule above).
 5. Verify:
    `select * from ewt_labor_search(<base_vehicle_id>, '<SECTION>', null, null, null, <engine_config_id>, <vehicle_id>) where mechanical_estimating_id < 0;`
    The rows should come back with `labor_price`.
