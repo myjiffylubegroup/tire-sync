@@ -110,9 +110,9 @@ unless you grant it access in Privacy & Security → Files & Folders.
 Some generations are thin in MOTOR's own file, not in our load, so
 reloading won't fix them. Example: 2011–2018 Ram 2500/3500 have only five
 BRAKES operations (front axle brakes R&R, and no rear axle, rotor or caliper).
-2010 and 2019+ are complete. Other thin ones found 2026-10-27, not yet
-supplemented: 2014–15 Audi RS7, 2012–15 Honda Crosstour, 2013–16 Lincoln MKZ
-and 2015–16 Mercedes C300.
+2010 and 2019+ are complete. Supplemented so far: that Ram, 2013–2020 Lincoln
+MKZ and 2012–2015 Honda Crosstour (brakes only). Still thin and not
+supplemented: 2014–15 Audi RS7 and 2015–16 Mercedes C300.
 
 `ewt_labor_supplement` (migration `ewt_labor_supplement`, applied 2026-10-27;
 source in `supabase/sql/ewt_labor_supplement.sql`) holds shop-estimated
@@ -145,7 +145,7 @@ operations for those gaps.
 
 ### What's seeded
 
-2011–2018 Ram 2500 (base vehicles 97150, 118690, 124258, 128169, 130184,
+**Ram 2500/3500 2011–2018:** 2500 (base vehicles 97150, 118690, 124258, 128169, 130184,
 137051, 140918, 145143) and 3500 (97151, 118694, 124259, 128212, 130185,
 137052, 140917, 145144). All rows are BRAKES › BRAKE COMPONENTS, copied from
 MOTOR's 2010 Dodge Ram and approved by Sean on 2026-10-27:
@@ -164,6 +164,35 @@ used, because they're standalone jobs that include pulling the wheel. Stacked
 on the 0.9 brake job, they'd charge for it twice: a rear pads + rotors +
 calipers job would come to 3.3 hr instead of 1.7.
 
+**Lincoln MKZ 2013–2020** (base vehicles 124247, 127778, 130057, 134765,
+140517, 145332, 147391, 150500). MOTOR applies only a brake vacuum sensor to
+these. Its CD4 Ford Fusion rows are labelled "Fusion, MKZ" and are identical
+for 2013–2020, so they're copied verbatim (seeded 2026-10-27):
+
+| Description | Hours | Add-on |
+|---|---|---|
+| BOTH AXLES; Fusion, MKZ | 1.6 | no |
+| FRONT AXLE; Fusion, MKZ | 0.9 | no |
+| REAR AXLE; Fusion, MKZ | 0.9 | no |
+| To R&I Or R&R Rotor, Add; Front; Both Sides / One Side | 0.4 / 0.2 | yes |
+| To R&I Or R&R Rotor, Add; Rear; Both Sides / One Side | 0.4 / 0.2 | yes |
+| To R&R Caliper, Add; Each | 0.2 | yes |
+
+**Honda Crosstour 2012–2015** (base vehicles 118775, 123281, 128095, 130181).
+MOTOR applies only the VSA switch. Copied from MOTOR's 2010–2011 Accord
+Crosstour (same generation; VCdb renamed the model for 2012):
+
+| Description | Hours | Add-on |
+|---|---|---|
+| FRONT AXLE; Accord Crosstour | 0.9 | no |
+| REAR AXLE; Accord Crosstour | 0.9 | no |
+| To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
+| To R&R Caliper, Add; Each | 0.2 | yes |
+
+Source: `supabase/sql/ewt_labor_supplement_mkz_crosstour.sql`. The same MOTOR
+sources also have hose, caliper overhaul, rotor refacing and parking brake
+add-ons, which weren't seeded.
+
 ### Add a gap
 
 1. Confirm the gap is in MOTOR, not in our load: compare the operation count
@@ -176,7 +205,9 @@ calipers job would come to 3.3 hr instead of 1.7.
    ```
 2. Pull the neighbouring generation's rows (group, subgroup, operation,
    qualifier, description, hours) to copy their shape.
-3. Get Sean's OK on the hours.
+3. Hours copied verbatim from MOTOR for the same platform and generation
+   can go in without asking (Sean, 2026-10-27). If a figure has no
+   same-platform MOTOR source, or the sources disagree, get Sean's call first.
 4. Insert the rows:
    ```sql
    insert into ewt_labor_supplement
