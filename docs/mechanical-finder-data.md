@@ -111,8 +111,9 @@ Some generations are thin in MOTOR's own file, not in our load, so
 reloading won't fix them. Example: 2011–2018 Ram 2500/3500 have only five
 BRAKES operations (front axle brakes R&R, and no rear axle, rotor or caliper).
 2010 and 2019+ are complete. Supplemented so far: that Ram, 2013–2020 Lincoln
-MKZ and 2012–2015 Honda Crosstour (brakes only). Still thin and not
-supplemented: 2014–15 Audi RS7 and 2015–16 Mercedes C300.
+MKZ, 2012–2015 Honda Crosstour and 2015–2016 Mercedes C300 (brakes only).
+Still thin and not supplemented: 2014–15 Audi RS7 (waiting on Sean: MOTOR's
+same-platform rotor add-on figures disagree, see below).
 
 `ewt_labor_supplement` (migration `ewt_labor_supplement`, applied 2026-10-27;
 source in `supabase/sql/ewt_labor_supplement.sql`) holds shop-estimated
@@ -192,6 +193,28 @@ Crosstour (same generation; VCdb renamed the model for 2012):
 Source: `supabase/sql/ewt_labor_supplement_mkz_crosstour.sql`. The same MOTOR
 sources also have hose, caliper overhaul, rotor refacing and parking brake
 add-ons, which weren't seeded.
+
+**Mercedes-Benz C300 2015–2016** (W205; base vehicles 131072, 136661). MOTOR
+applies only four ABS speed sensor ops. Copied from MOTOR's 2017–2019 C300
+(same W205 generation, identical every year). Source:
+`supabase/sql/ewt_labor_supplement_c300.sql`.
+
+| Description | Hours | Add-on |
+|---|---|---|
+| FRONT AXLE; C Class | 0.9 | no |
+| REAR AXLE; C Class | 0.9 | no |
+| To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
+| To R&R Caliper, Add; Each | 0.2 | yes |
+
+MOTOR's 2017+ C300 also prices rotor and caliper as standalone jobs (1.2 hr
+both sides, 1.4 for rear rotors). Those weren't used, for the same
+double-counting reason as the Ram.
+
+**Audi RS7 2014–2015** (C7; base vehicles 127035, 130085): **not seeded**.
+MOTOR's C7 sources agree on front/rear axle brakes R&R (0.9) and the caliper
+add-on (+0.2 each), but not on the rotor add-on. The 2016–18 RS7 says +0.2
+each; the 2014–15 S7 and A7 say +0.3 each. Waiting on Sean to pick one.
+
 
 ### Add a gap
 
