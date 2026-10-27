@@ -305,6 +305,16 @@ and 2023 Sequoia (0.5). Sean chose "0.8 from 2022+ Tundra" for both models.
 - **Label:** "Tundra; 4WD" / "Sequoia; 4WD", so a 2WD vehicle_id doesn't see it.
 - **Source:** the footnote and `source_note` say "2022 Tundra (next gen)".
 
+**Ford Escape 2022–2025: transfer case fluid, 0.8 h**
+(`supabase/sql/ewt_labor_supplement_escape_tc.sql`, 4 rows). MOTOR has the
+Escape's transfer case R&R and actuator jobs, but no fluid change in any
+section.
+- **The twins disagree:** Bronco Sport 1.0, Maverick 0.8, and the Corsair has
+  none. The Escape's own rear diff fluid (0.6) matches the Maverick's, so Sean
+  picked "0.8 hr from Maverick" on 2026-10-27.
+- **Shape:** copied from the same-year Maverick into section TRANSFER CASE.
+- **Label:** "Escape; AWD", so FWD vehicle_ids don't see it.
+
 ### Find gaps
 
 `supabase/sql/ewt_labor_gap_audit.sql` (migrations `ewt_gap_audit_1…4`,
