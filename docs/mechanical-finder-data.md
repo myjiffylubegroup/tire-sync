@@ -267,7 +267,7 @@ target that already has the operation, so it's safe to rerun.
 | Chevrolet Suburban | 2021–2025 | GMC Yukon XL | Same, lower and upper arm |
 | Chevrolet Equinox | 2025 | GMC Terrain | Same, lower arm |
 | Hyundai Sonata | 2025 | Kia K5 | Same, lower arm, plus rear differential fluid 0.5 |
-| Kia Telluride | 2020–2025 | Hyundai Palisade | Transfer case fluid 0.5 |
+| ~~Kia Telluride~~ | 2020–2025 | Hyundai Palisade | Transfer case fluid 0.5. **Deactivated 2026-10-27**: MOTOR already has it, filed under section TRANSFER CASE, which the first audit didn't read |
 | Ford Edge | 2016–2018 | Lincoln MKX | Rear differential fluid 0.7 |
 
 **Gap audit batch 2** (`supabase/sql/ewt_labor_supplement_gap_batch2.sql`,
@@ -296,8 +296,14 @@ Deliberately not filled:
 - **Highlander 2008–13 rear sway link.** The RX and Highlander sway bar hours
   differ.
 
-MOTOR has no transfer case fluid op for the 2014–21 Tundra in any nearby year
-or twin, so the audit can't flag it.
+**Toyota Tundra 2007–2021 and Sequoia 2008–2022: transfer case fluid**
+(`supabase/sql/ewt_labor_supplement_tundra_sequoia.sql`, 30 rows). MOTOR has
+no figure for these generations. Its only ones are the 2022–23 Tundra (0.8)
+and 2023 Sequoia (0.5). Sean chose "0.8 from 2022+ Tundra" for both models.
+- **Shape:** a base op, copied from MOTOR's 2022 Tundra row, so it sits in
+  MOTOR's own section TRANSFER CASE › TRANSFER CASE › FLUID › CHANGE.
+- **Label:** "Tundra; 4WD" / "Sequoia; 4WD", so a 2WD vehicle_id doesn't see it.
+- **Source:** the footnote and `source_note` say "2022 Tundra (next gen)".
 
 ### Find gaps
 
@@ -340,6 +346,13 @@ How it works:
   twins. Add a row there when you find a new pair. Keep the year range to
   the years the two really share a platform: Tundra/Sequoia, CR-V/RDX and
   Accord/Crosstour after 2012 were taken out because they differ.
+- **Fluids filed elsewhere.** MOTOR files some fluid changes outside
+  MAINTENANCE & LUBRICATION: TRANSFER CASE › TRANSFER CASE › FLUID (Telluride,
+  2022+ Tundra, many PTUs) and UNIVERSALS & REAR AXLE › DIFFERENTIAL. The
+  refresh folds any FLUID op in a TRANSFER CASE, DIFFERENTIAL or REAR AXLE
+  subgroup back into M&L (migration `ewt_gap_audit_5_fluid_sections`). The
+  first version missed this, so the Telluride was filled with a duplicate. When
+  you check "does MOTOR already have it", search every section.
 - **Equipment.** Rear rotor/caliper gaps need VCdb rear disc brakes.
   Differential and transfer case gaps need a VCdb RWD/4WD/AWD drive type. A
   base vehicle with no MOTOR rows at all is a coverage problem (newest model
