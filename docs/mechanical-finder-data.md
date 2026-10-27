@@ -111,9 +111,8 @@ Some generations are thin in MOTOR's own file, not in our load, so
 reloading won't fix them. Example: 2011–2018 Ram 2500/3500 have only five
 BRAKES operations (front axle brakes R&R, and no rear axle, rotor or caliper).
 2010 and 2019+ are complete. Supplemented so far: that Ram, 2013–2020 Lincoln
-MKZ, 2012–2015 Honda Crosstour and 2015–2016 Mercedes C300 (brakes only).
-Still thin and not supplemented: 2014–15 Audi RS7 (waiting on Sean: MOTOR's
-same-platform rotor add-on figures disagree, see below).
+MKZ, 2012–2015 Honda Crosstour, 2015–2016 Mercedes C300 and 2014–2015 Audi
+RS7 (brakes only).
 
 `ewt_labor_supplement` (migration `ewt_labor_supplement`, applied 2026-10-27;
 source in `supabase/sql/ewt_labor_supplement.sql`) holds shop-estimated
@@ -210,11 +209,20 @@ MOTOR's 2017+ C300 also prices rotor and caliper as standalone jobs (1.2 hr
 both sides, 1.4 for rear rotors). Those weren't used, for the same
 double-counting reason as the Ram.
 
-**Audi RS7 2014–2015** (C7; base vehicles 127035, 130085): **not seeded**.
-MOTOR's C7 sources agree on front/rear axle brakes R&R (0.9) and the caliper
-add-on (+0.2 each), but not on the rotor add-on. The 2016–18 RS7 says +0.2
-each; the 2014–15 S7 and A7 say +0.3 each. Waiting on Sean to pick one.
+**Audi RS7 2014–2015** (C7; base vehicles 127035, 130085). MOTOR applies only
+the vacuum pump. Copied from MOTOR's 2016–2018 RS7. Source:
+`supabase/sql/ewt_labor_supplement_rs7.sql`.
 
+| Description | Hours | Add-on |
+|---|---|---|
+| FRONT AXLE; All Models | 0.9 | no |
+| REAR AXLE; All Models | 0.9 | no |
+| To R&I Or R&R Rotor, Add; Each | 0.2 | yes |
+| To R&R Caliper, Add; Each | 0.2 | yes |
+
+MOTOR's C7 sources disagree on the rotor add-on: the 2016–18 RS7 says +0.2
+each, and the 2014–15 S7 and A7 say +0.3. Sean picked +0.2, the RS7's own
+figure, on 2026-10-27.
 
 ### Add a gap
 
