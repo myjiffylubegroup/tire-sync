@@ -9,6 +9,7 @@ refreshes by itself.** Someone has to run each load by hand.
 |---|---|---|---|
 | Year / make / model / submodel / engine picker | AutoCare **VCdb** (the ACES vehicle database) | `vcdb_*` (14 tables) | `POST /sync/vcdb` (manual file upload) |
 | Labor operations and hours | MOTOR **GEN4.5 Mechanical EWT** (Estimated Work Times) | `ewt_labor`, `ewt_applications`, `ewt_applications_vcdb_attribute_xref` | `POST /sync/ewt` (pulls from MOTOR SFTP) |
+| Labor MOTOR doesn't have (shown with a "Shop estimate — not MOTOR" note) | Our own shop estimates | `ewt_labor_supplement` | SQL by hand (see [Supplemental labor](#supplemental-labor)) |
 
 The datasets are joined on VCdb `base_vehicle_id`. If VCdb has a vehicle and
 EWT doesn't, the vehicle appears in the picker but returns no labor. That's
@@ -101,3 +102,96 @@ unless you grant it access in Privacy & Security → Files & Folders.
    base_vehicle_id = 177696;` should be above 0.
 6. Add the new load to the history tables in this doc, and copy the files you
    loaded into the Drive archive.
+7. Check whether the new file filled any of the gaps in `ewt_labor_supplement`
+   (see the next section). If it did, deactivate those supplement rows.
+
+## Supplemental labor
+
+Some generations are thin in MOTOR's own file, not in our load, so
+reloading won't fix them. Example: 2011–2018 Ram 2500/3500 have only five
+BRAKES operations (front axle brakes R&R, and no rear axle, rotor or caliper).
+2010 and 2019+ are complete. Other thin ones found 2026-10-27, not yet
+supplemented: 2014–15 Audi RS7, 2012–15 Honda Crosstour, 2013–16 Lincoln MKZ
+and 2015–16 Mercedes C300.
+
+`ewt_labor_supplement` (migration `ewt_labor_supplement`, applied 2026-10-27;
+source in `supabase/sql/ewt_labor_supplement.sql`) holds shop-estimated
+operations for those gaps.
+
+- **The EWT sync doesn't touch it.** `/sync/ewt` truncates its three tables by
+  name, and this table isn't one of them.
+- **How it reaches MechanicalFinder:** `ewt_labor_tree` and `ewt_labor_search`
+  UNION in active rows for the base vehicle. The `ewt-labor-search` edge
+  function and the frontend didn't change.
+  - Each row comes back as `mechanical_estimating_id = -supplement_id`.
+    MOTOR ids are positive, so the two can't collide, and the cart, the React
+    keys and the quote save path treat it like any MOTOR row.
+    `mechanical_quote_items` has no FK on that column.
+  - `labor_price` is computed from `mechanical_labor_rate`, like MOTOR rows.
+  - The footnote must start with `Shop estimate — not MOTOR` (a CHECK
+    enforces it). It shows under the line in MechanicalFinder and on the
+    saved quote.
+- **Filters:** `engine_config_id` NULL means every engine on the base vehicle.
+  Drivetrain markers in `motor_db_description` (4WD, RWD …) filter it the same
+  way they filter MOTOR rows. There's no VCdb attribute xref, so SubModel and
+  other Tier 1 filters don't apply. If an operation only fits one submodel,
+  say so in the description.
+- **UI conventions, same as MOTOR:** `is_additional_operation = true` gives
+  the ADD-ON badge and indent. The word "Each" in `motor_db_description` turns
+  on the EACH badge and the quantity stepper.
+- **Hours need sign-off.** Fill `source_note` (where the figure came from)
+  and `approved_by` on every row. Prefer MOTOR's figure for the neighbouring
+  generation, in MOTOR's own wording.
+
+### What's seeded
+
+2011–2018 Ram 2500 (base vehicles 97150, 118690, 124258, 128169, 130184,
+137051, 140918, 145143) and 3500 (97151, 118694, 124259, 128212, 130185,
+137052, 140917, 145144). All rows are BRAKES › BRAKE COMPONENTS, copied from
+MOTOR's 2010 Dodge Ram and approved by Sean on 2026-10-27:
+
+| Description | Hours | Add-on |
+|---|---|---|
+| REAR AXLE; Ram 2500, 3500 (brakes R&R) | 0.9 | no |
+| To R&I Or R&R Rotor, Add; Front; Each | 0.2 | yes |
+| To R&I Or R&R Rotor, Add; Rear; w/o Dual Rear Wheels; Each | 0.2 | yes |
+| To R&I Or R&R Rotor, Add; Rear; w/Dual Rear Wheels; Each (3500 only) | 0.6 | yes |
+| To R&R Caliper, Add; Front; Each | 0.2 | yes |
+| To R&R Caliper, Add; Rear; Each | 0.2 | yes |
+
+MOTOR's 2019+ figures (rotor and caliper R&R both sides, 1.2 hr each) were not
+used, because they're standalone jobs that include pulling the wheel. Stacked
+on the 0.9 brake job, they'd charge for it twice: a rear pads + rotors +
+calipers job would come to 3.3 hr instead of 1.7.
+
+### Add a gap
+
+1. Confirm the gap is in MOTOR, not in our load: compare the operation count
+   for the base vehicle against the generations on either side.
+   ```sql
+   select a.base_vehicle_id, count(distinct a.mechanical_estimating_id)
+   from ewt_applications a join ewt_labor l using (mechanical_estimating_id)
+   where a.base_vehicle_id in (...) and l.motor_db_section = 'BRAKES'
+   group by 1;
+   ```
+2. Pull the neighbouring generation's rows (group, subgroup, operation,
+   qualifier, description, hours) to copy their shape.
+3. Get Sean's OK on the hours.
+4. Insert the rows:
+   ```sql
+   insert into ewt_labor_supplement
+     (base_vehicle_id, motor_db_section, motor_db_group, motor_db_subgroup,
+      motor_db_operation, qualifier_description, motor_time,
+      is_additional_operation, motor_db_description, source_note, approved_by)
+   values (...);
+   ```
+   Leave `motor_db_footnote` at its default, or append to it (for example
+   `'Shop estimate — not MOTOR. Does not Include: Bleed Master Cylinder.'`).
+5. Verify:
+   `select * from ewt_labor_search(<base_vehicle_id>, '<SECTION>', null, null, null, <engine_config_id>, <vehicle_id>) where mechanical_estimating_id < 0;`
+   The rows should come back with `labor_price`.
+
+### Retire a row
+
+Once MOTOR covers an operation, set `active = false` on the supplement row.
+Don't delete it, because saved quotes may still carry its negative id.
